@@ -1,8 +1,10 @@
 """
 SPC / Quality Dashboard
 Reads QAP-style data from Google Sheets (public "anyone with link can view")
-and plots Value-vs-Time and Cpk-vs-Time charts for every numeric parameter
-column found on each tab, grouped by "Sampling Qty".
+and plots:
+  - Value vs Time + Cpk vs Time for every NUMERIC parameter column
+  - OK vs NOK bar chart (green/red) for every ATTRIBUTE (pass/fail) column
+grouped by the "Sampling Qty" cell for each column.
 
 Sheet layout this app expects (row numbers, 1-indexed, same for every tab):
     Row 4  -> Parameter title
@@ -11,17 +13,19 @@ Sheet layout this app expects (row numbers, 1-indexed, same for every tab):
     Row 8  -> Sampling Qty (group size used to average points on the graph)
     Row 9+ -> Data. Col A = Date, Col B = Time, Col C = sample counter,
               Col D onward = one column per parameter.
+
 Data columns are auto-detected: any column from D onward that has a
-non-empty title in row 4 is treated as a parameter. Columns whose
-USL/LSL are not numbers (e.g. "Visual") are skipped from the
-numeric/Cpk charts automatically.
+non-empty title in row 4 is treated as a parameter column.
+  - If USL/LSL (rows 6/7) are numbers -> treated as a NUMERIC parameter
+    (Value vs Time + Cpk vs Time charts).
+  - If USL/LSL are not numbers (e.g. "Visual") -> treated as an
+    ATTRIBUTE / OK-NOK parameter (green/red bar chart over time).
 
 Configure your lines (line name -> Google Sheet ID) in LINES below.
 Requires a Google Sheets API key stored in Streamlit secrets as
 GOOGLE_API_KEY (see README.md).
 """
 
-import re
 from datetime import datetime
 
 import numpy as np
@@ -38,7 +42,7 @@ import streamlit as st
 # --------------------------------------------------------------------------
 LINES = {
     "Line 1 - Crankcase Master Metal VSD Short Leg": "1vfOOhvjS2yAix5wfutoKKQNdGPQp4lmlzqqRwHn0i84",
-    "Line 2": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
+    "Line 2 - Crankcase Master Metal VSD Long Leg": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
 }
 
 TITLE_ROW = 4          # row with parameter name / graph title
@@ -49,10 +53,14 @@ DATA_START_ROW = 9      # first row of actual data
 DATE_COL = 0             # column A (0-indexed)
 TIME_COL = 1             # column B (0-indexed)
 FIRST_PARAM_COL = 3      # column D (0-indexed) -> first parameter column
-MAX_COLS = 60            # how many columns wide to scan (A..BH ish, adjust if needed)
+MAX_COLS = 60            # how many columns wide to scan
 MAX_ROWS = 2000          # how many rows deep to scan for data
 
 CPK_TARGET_LINE = 1.33   # common minimum-acceptable Cpk reference line
+DECIMALS = 3             # USL/LSL/values are rounded & displayed to this many places
+
+PASS_VALUES = {"OK", "OKAY", "PASS", "PASSED", "GOOD"}
+FAIL_VALUES = {"NG", "NOT OK", "NOK", "NOTOK", "FAIL", "FAILED", "REJECT", "REJECTED"}
 
 # --------------------------------------------------------------------------
 # Google Sheets API helpers (public API key auth — sheet must be shared as
@@ -72,7 +80,7 @@ def get_api_key() -> str:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def list_tabs(spreadsheet_id: str) -> list[str]:
+def list_tabs(spreadsheet_id: str) -> list:
     """Return the list of tab (worksheet) names in a spreadsheet."""
     api_key = get_api_key()
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}"
@@ -86,10 +94,9 @@ def list_tabs(spreadsheet_id: str) -> list[str]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_tab_values(spreadsheet_id: str, tab_name: str) -> list[list[str]]:
+def get_tab_values(spreadsheet_id: str, tab_name: str) -> list:
     """Return the raw grid values (list of rows) for a tab."""
     api_key = get_api_key()
-    # Quote the tab name in case it has spaces / special characters.
     safe_tab = tab_name.replace("'", "''")
     rng = f"'{safe_tab}'!A1:BZ{MAX_ROWS}"
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/{rng}"
@@ -107,18 +114,35 @@ def get_tab_values(spreadsheet_id: str, tab_name: str) -> list[list[str]]:
 # --------------------------------------------------------------------------
 
 def to_float(val):
+    """Parse a cell into a float, or NaN if it isn't numeric. Rounded to a
+    few extra decimal places beyond DECIMALS to kill binary floating-point
+    noise like 15.866999999999 that should really be 15.867."""
     if val is None:
         return np.nan
     if isinstance(val, (int, float)):
-        return float(val)
+        return round(float(val), DECIMALS + 3)
     s = str(val).strip()
     if s == "" or s.upper() in {"OK", "NG", "NOT OK", "N/A", "NA", "VISUAL"}:
         return np.nan
     s = s.replace(",", "")
     try:
-        return float(s)
+        return round(float(s), DECIMALS + 3)
     except ValueError:
         return np.nan
+
+
+def classify_status(val):
+    """Classify a raw attribute-column cell as 'OK', 'NOK', or None (blank/unknown)."""
+    if val is None:
+        return None
+    s = str(val).strip().upper()
+    if s == "":
+        return None
+    if s in PASS_VALUES:
+        return "OK"
+    if s in FAIL_VALUES:
+        return "NOK"
+    return None
 
 
 def parse_datetime(date_val, time_val):
@@ -144,12 +168,20 @@ def cell(grid, row_idx, col_idx):
     return val if val != "" else None
 
 
+def fmt(val):
+    """Format a number to exactly DECIMALS places for display."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return "-"
+    return f"{val:.{DECIMALS}f}"
+
+
 # --------------------------------------------------------------------------
-# Core: discover parameter columns on a tab
+# Core: discover parameter columns on a tab (numeric + attribute)
 # --------------------------------------------------------------------------
 
-def discover_parameters(grid: list[list[str]]) -> list[dict]:
-    """Scan header rows and return metadata for every valid parameter column."""
+def discover_parameters(grid: list) -> list:
+    """Scan header rows and return metadata for every parameter column,
+    tagged as 'numeric' (has numeric USL/LSL) or 'attribute' (OK/NOK type)."""
     if not grid:
         return []
     header_len = max((len(r) for r in grid[:TITLE_ROW + 2]), default=0)
@@ -163,23 +195,31 @@ def discover_parameters(grid: list[list[str]]) -> list[dict]:
         usl = to_float(cell(grid, USL_ROW - 1, col_idx))
         lsl = to_float(cell(grid, LSL_ROW - 1, col_idx))
         sample_qty = to_float(cell(grid, SAMPLE_QTY_ROW - 1, col_idx))
-        if np.isnan(usl) or np.isnan(lsl):
-            # Non-numeric spec (e.g. "Visual" / "Ok"/"Not Ok") -> not a
-            # measurable/Cpk-able parameter, skip it.
-            continue
         sample_qty = int(sample_qty) if not np.isnan(sample_qty) and sample_qty >= 1 else 1
-        params.append({
-            "col_idx": col_idx,
-            "title": str(title).strip(),
-            "usl": usl,
-            "lsl": lsl,
-            "sample_qty": sample_qty,
-        })
+
+        if np.isnan(usl) or np.isnan(lsl):
+            params.append({
+                "col_idx": col_idx,
+                "title": str(title).strip(),
+                "type": "attribute",
+                "usl": None,
+                "lsl": None,
+                "sample_qty": sample_qty,
+            })
+        else:
+            params.append({
+                "col_idx": col_idx,
+                "title": str(title).strip(),
+                "type": "numeric",
+                "usl": usl,
+                "lsl": lsl,
+                "sample_qty": sample_qty,
+            })
     return params
 
 
-def build_raw_dataframe(grid: list[list[str]], param: dict) -> pd.DataFrame:
-    """Pull raw (row-level) date/time/value rows for one parameter column."""
+def build_raw_dataframe(grid: list, param: dict) -> pd.DataFrame:
+    """Pull raw (row-level) date/time/value(+status) rows for one parameter column."""
     rows = []
     row_idx = DATA_START_ROW - 1
     empty_streak = 0
@@ -197,12 +237,15 @@ def build_raw_dataframe(grid: list[list[str]], param: dict) -> pd.DataFrame:
         empty_streak = 0
 
         dt = parse_datetime(date_val, time_val)
-        value = to_float(raw_val)
-        rows.append({"datetime": dt, "value": value})
+        if param["type"] == "numeric":
+            value = to_float(raw_val)
+            rows.append({"datetime": dt, "value": value})
+        else:
+            status = classify_status(raw_val)
+            rows.append({"datetime": dt, "status": status, "raw": raw_val})
         row_idx += 1
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: float) -> pd.DataFrame:
@@ -218,21 +261,15 @@ def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: floa
         vals = g["value"].dropna()
         if vals.empty:
             continue
-        avg = vals.mean()
+        avg = round(vals.mean(), DECIMALS + 3)
         std = vals.std(ddof=1) if len(vals) > 1 else np.nan
         if std is None or np.isnan(std) or std == 0:
             cpk = np.nan
         else:
             cpk = min((usl - avg) / (3 * std), (avg - lsl) / (3 * std))
-        # x-axis point: use the datetime of the last sample in the group
         dt_series = g["datetime"].dropna()
         dt_point = dt_series.iloc[-1] if not dt_series.empty else pd.NaT
-        records.append({
-            "datetime": dt_point,
-            "avg_value": avg,
-            "cpk": cpk,
-            "n": len(vals),
-        })
+        records.append({"datetime": dt_point, "avg_value": avg, "cpk": cpk, "n": len(vals)})
     return pd.DataFrame(records)
 
 
@@ -246,11 +283,12 @@ def plot_value_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
         x=agg["datetime"], y=agg["avg_value"],
         mode="lines+markers", name="Average value",
         line=dict(color="#1f77b4"),
+        hovertemplate="%{x}<br>Value: %{y:.3f}<extra></extra>",
     ))
     fig.add_hline(y=param["usl"], line=dict(color="red", dash="dash"),
-                  annotation_text=f"USL {param['usl']}", annotation_position="top left")
+                  annotation_text=f"USL {fmt(param['usl'])}", annotation_position="top left")
     fig.add_hline(y=param["lsl"], line=dict(color="red", dash="dash"),
-                  annotation_text=f"LSL {param['lsl']}", annotation_position="bottom left")
+                  annotation_text=f"LSL {fmt(param['lsl'])}", annotation_position="bottom left")
     fig.update_layout(
         title=f"{param['title']} — Value vs Time",
         xaxis_title="Time", yaxis_title="Value",
@@ -265,6 +303,7 @@ def plot_cpk_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
         x=agg["datetime"], y=agg["cpk"],
         mode="lines+markers", name="Cpk",
         line=dict(color="#2ca02c"),
+        hovertemplate="%{x}<br>Cpk: %{y:.3f}<extra></extra>",
     ))
     fig.add_hline(y=CPK_TARGET_LINE, line=dict(color="orange", dash="dash"),
                   annotation_text=f"Target {CPK_TARGET_LINE}", annotation_position="top left")
@@ -274,6 +313,34 @@ def plot_cpk_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
         title=f"{param['title']} — Cpk vs Time",
         xaxis_title="Time", yaxis_title="Cpk",
         height=380, margin=dict(t=60, b=40),
+    )
+    return fig
+
+
+def plot_attribute_chart(raw_df: pd.DataFrame, param: dict) -> go.Figure:
+    """Bar chart over time for an OK/NOK (attribute) parameter.
+    Green bar = OK, red bar = NOK. Unclassified/blank rows are skipped."""
+    df = raw_df.dropna(subset=["status"]).copy()
+    df = df.reset_index(drop=True)
+    df["x_label"] = df.index.astype(str)  # fallback if datetime missing
+    has_dt = df["datetime"].notna().any()
+    x_vals = df["datetime"] if has_dt else df["x_label"]
+
+    colors = df["status"].map({"OK": "#2ca02c", "NOK": "#d62728"})
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x_vals, y=[1] * len(df),
+        marker_color=colors,
+        customdata=df[["status", "raw"]],
+        hovertemplate="%{x}<br>Result: %{customdata[0]}<extra></extra>",
+        name="Result",
+    ))
+    fig.update_layout(
+        title=f"{param['title']} — OK / NOK over time "
+              f"(OK: {(df['status'] == 'OK').sum()}, NOK: {(df['status'] == 'NOK').sum()})",
+        xaxis_title="Time", yaxis=dict(showticklabels=False, title=""),
+        height=320, margin=dict(t=60, b=40), showlegend=False,
     )
     return fig
 
@@ -304,17 +371,20 @@ def main():
 
         params = discover_parameters(grid)
         if not params:
-            st.warning("No numeric parameter columns found on this tab "
+            st.warning("No parameter columns found on this tab "
                        "(check that row 4/6/7/8 are filled in).")
             st.stop()
 
-        param_titles = [p["title"] for p in params]
-        selected_titles = st.multiselect(
-            "Parameter(s)", param_titles, default=param_titles[: min(3, len(param_titles))]
+        def label(p):
+            return p["title"] if p["type"] == "numeric" else f"{p['title']}  [OK/NOK]"
+
+        param_labels = [label(p) for p in params]
+        selected_labels = st.multiselect(
+            "Parameter(s)", param_labels, default=param_labels[: min(3, len(param_labels))]
         )
 
-        # Build a combined date range from all data (based on first selected
-        # parameter, since date/time columns are shared across the tab).
+        # Date range, based on the first parameter's dates (Date/Time
+        # columns A/B are shared across the whole tab).
         sample_df = build_raw_dataframe(grid, params[0]) if params else pd.DataFrame()
         valid_dates = sample_df["datetime"].dropna() if not sample_df.empty else pd.Series(dtype="datetime64[ns]")
         if not valid_dates.empty:
@@ -328,13 +398,18 @@ def main():
             date_range = None
             st.info("No parseable dates found in column A for this tab.")
 
-        st.caption(f"{len(params)} numeric parameter(s) detected on this tab.")
+        st.caption(f"{len(params)} parameter(s) detected on this tab.")
+        if st.button("🔄 Refresh data"):
+            list_tabs.clear()
+            get_tab_values.clear()
+            st.rerun()
 
-    if not selected_titles:
+    if not selected_labels:
         st.info("Select at least one parameter from the sidebar to see charts.")
         return
 
-    selected_params = [p for p in params if p["title"] in selected_titles]
+    label_to_param = {label(p): p for p in params}
+    selected_params = [label_to_param[l] for l in selected_labels]
 
     for param in selected_params:
         raw_df = build_raw_dataframe(grid, param)
@@ -344,28 +419,52 @@ def main():
             mask = (raw_df["datetime"].dt.date >= start) & (raw_df["datetime"].dt.date <= end)
             raw_df = raw_df[mask | raw_df["datetime"].isna()]
 
-        agg = group_and_aggregate(raw_df, param["sample_qty"], param["usl"], param["lsl"])
-
         st.subheader(param["title"])
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("USL", param["usl"])
-        c2.metric("LSL", param["lsl"])
-        c3.metric("Sample qty / point", param["sample_qty"])
-        c4.metric("Points plotted", len(agg))
 
-        if agg.empty:
-            st.warning("No data available for the selected date range.")
-            st.divider()
-            continue
+        if param["type"] == "numeric":
+            agg = group_and_aggregate(raw_df, param["sample_qty"], param["usl"], param["lsl"])
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(plot_value_chart(agg, param), use_container_width=True)
-        with col2:
-            st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("USL", fmt(param["usl"]))
+            c2.metric("LSL", fmt(param["lsl"]))
+            c3.metric("Sample qty / point", param["sample_qty"])
+            c4.metric("Points plotted", len(agg))
 
-        with st.expander("Show data table"):
-            st.dataframe(agg, use_container_width=True)
+            if agg.empty:
+                st.warning("No data available for the selected date range.")
+                st.divider()
+                continue
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(plot_value_chart(agg, param), use_container_width=True)
+            with col2:
+                st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True)
+
+            with st.expander("Show data table"):
+                st.dataframe(agg.assign(
+                    avg_value=agg["avg_value"].round(DECIMALS),
+                    cpk=agg["cpk"].round(DECIMALS),
+                ), use_container_width=True)
+
+        else:  # attribute / OK-NOK parameter
+            if raw_df.empty or raw_df["status"].dropna().empty:
+                st.warning("No OK/NOK data available for the selected date range.")
+                st.divider()
+                continue
+
+            ok_count = (raw_df["status"] == "OK").sum()
+            nok_count = (raw_df["status"] == "NOK").sum()
+            total = ok_count + nok_count
+            c1, c2, c3 = st.columns(3)
+            c1.metric("OK", int(ok_count))
+            c2.metric("NOK", int(nok_count))
+            c3.metric("NOK rate", f"{(nok_count/total*100):.1f}%" if total else "-")
+
+            st.plotly_chart(plot_attribute_chart(raw_df, param), use_container_width=True)
+
+            with st.expander("Show data table"):
+                st.dataframe(raw_df[["datetime", "raw", "status"]], use_container_width=True)
 
         st.divider()
 
