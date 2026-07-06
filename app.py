@@ -14,19 +14,20 @@ Sheet layout this app expects (row numbers, 1-indexed, same for every tab):
     Row 9+ -> Data. Col A = Date, Col B = Time, Col C = sample counter,
               Col D onward = one column per parameter.
 
-Data columns are auto-detected: any column from D onward that has a
-non-empty title in row 4 is treated as a parameter column.
-  - If USL/LSL (rows 6/7) are numbers -> treated as a NUMERIC parameter
-    (Value vs Time + Cpk vs Time charts).
-  - If USL/LSL are not numbers (e.g. "Visual") -> treated as an
-    ATTRIBUTE / OK-NOK parameter (green/red bar chart over time).
+HOW A COLUMN IS CLASSIFIED (data-driven, not header-driven):
+For every column from D onward with a non-empty title in row 4, the app
+reads the actual data starting at row 9 in THAT column. If it finds
+OK / NOK - type text values (OK, NG, NOT OK, PASS, FAIL, etc.) in that
+column's data, the column is treated as an ATTRIBUTE column -> a green/red
+bar chart over time. If it finds numeric values instead, it's a NUMERIC
+column -> Value vs Time + Cpk vs Time charts using USL/LSL from rows 6/7.
+This matches columns anywhere in the sheet (e.g. G, I, J, K, M, N, O, P,
+S, V, W, X, Y, Z, ...) regardless of what's in the header rows.
 
 Configure your lines (line name -> Google Sheet ID) in LINES below.
 Requires a Google Sheets API key stored in Streamlit secrets as
 GOOGLE_API_KEY (see README.md).
 """
-
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -53,14 +54,15 @@ DATA_START_ROW = 9      # first row of actual data
 DATE_COL = 0             # column A (0-indexed)
 TIME_COL = 1             # column B (0-indexed)
 FIRST_PARAM_COL = 3      # column D (0-indexed) -> first parameter column
-MAX_COLS = 60            # how many columns wide to scan
+MAX_COLS = 80            # how many columns wide to scan
 MAX_ROWS = 2000          # how many rows deep to scan for data
+EMPTY_ROW_STOP = 5       # stop scanning a column after this many fully-empty rows in a row
 
 CPK_TARGET_LINE = 1.33   # common minimum-acceptable Cpk reference line
 DECIMALS = 3             # USL/LSL/values are rounded & displayed to this many places
 
-PASS_VALUES = {"OK", "OKAY", "PASS", "PASSED", "GOOD"}
-FAIL_VALUES = {"NG", "NOT OK", "NOK", "NOTOK", "FAIL", "FAILED", "REJECT", "REJECTED"}
+PASS_VALUES = {"OK", "OKAY", "PASS", "PASSED", "GOOD", "ACCEPT", "ACCEPTED"}
+FAIL_VALUES = {"NG", "NOT OK", "NOTOK", "NOK", "FAIL", "FAILED", "REJECT", "REJECTED", "NO"}
 
 # --------------------------------------------------------------------------
 # Google Sheets API helpers (public API key auth — sheet must be shared as
@@ -122,18 +124,20 @@ def to_float(val):
     if isinstance(val, (int, float)):
         return round(float(val), DECIMALS + 3)
     s = str(val).strip()
-    if s == "" or s.upper() in {"OK", "NG", "NOT OK", "N/A", "NA", "VISUAL"}:
+    if s == "":
         return np.nan
-    s = s.replace(",", "")
+    s2 = s.replace(",", "")
     try:
-        return round(float(s), DECIMALS + 3)
+        return round(float(s2), DECIMALS + 3)
     except ValueError:
         return np.nan
 
 
 def classify_status(val):
-    """Classify a raw attribute-column cell as 'OK', 'NOK', or None (blank/unknown)."""
+    """Classify a raw cell as 'OK', 'NOK', or None (blank/unrecognized/numeric)."""
     if val is None:
+        return None
+    if isinstance(val, (int, float)):
         return None
     s = str(val).strip().upper()
     if s == "":
@@ -176,12 +180,49 @@ def fmt(val):
 
 
 # --------------------------------------------------------------------------
-# Core: discover parameter columns on a tab (numeric + attribute)
+# Core: scan one column's data (row 9+), then decide its type from what's
+# actually in the data — this is the key fix: classification is data-driven,
+# not based on what's in the USL/LSL header rows.
 # --------------------------------------------------------------------------
 
+def scan_column(grid: list, col_idx: int) -> pd.DataFrame:
+    """Read every data row (from DATA_START_ROW) for one column, returning
+    datetime + raw + value(numeric-or-NaN) + status(OK/NOK-or-None)."""
+    rows = []
+    row_idx = DATA_START_ROW - 1
+    empty_streak = 0
+    while row_idx < len(grid) and row_idx < MAX_ROWS:
+        date_val = cell(grid, row_idx, DATE_COL)
+        time_val = cell(grid, row_idx, TIME_COL)
+        raw_val = cell(grid, row_idx, col_idx)
+
+        if date_val is None and time_val is None and raw_val is None:
+            empty_streak += 1
+            if empty_streak >= EMPTY_ROW_STOP:
+                break
+            row_idx += 1
+            continue
+        empty_streak = 0
+
+        dt = parse_datetime(date_val, time_val)
+        rows.append({
+            "datetime": dt,
+            "raw": raw_val,
+            "value": to_float(raw_val),
+            "status": classify_status(raw_val),
+        })
+        row_idx += 1
+
+    return pd.DataFrame(rows, columns=["datetime", "raw", "value", "status"])
+
+
 def discover_parameters(grid: list) -> list:
-    """Scan header rows and return metadata for every parameter column,
-    tagged as 'numeric' (has numeric USL/LSL) or 'attribute' (OK/NOK type)."""
+    """Scan every column from D onward that has a title in row 4. For each,
+    scan its data and decide numeric vs attribute based on the DATA itself:
+      - any recognized OK/NOK text in the column's data -> 'attribute'
+      - otherwise any numeric value in the column's data -> 'numeric'
+      - otherwise (no usable data at all) -> column is skipped
+    """
     if not grid:
         return []
     header_len = max((len(r) for r in grid[:TITLE_ROW + 2]), default=0)
@@ -192,12 +233,18 @@ def discover_parameters(grid: list) -> list:
         title = cell(grid, TITLE_ROW - 1, col_idx)
         if title is None or str(title).strip() == "":
             continue
-        usl = to_float(cell(grid, USL_ROW - 1, col_idx))
-        lsl = to_float(cell(grid, LSL_ROW - 1, col_idx))
+
+        raw_df = scan_column(grid, col_idx)
+        if raw_df.empty:
+            continue
+
+        has_status = raw_df["status"].notna().any()
+        has_numeric = raw_df["value"].notna().any()
+
         sample_qty = to_float(cell(grid, SAMPLE_QTY_ROW - 1, col_idx))
         sample_qty = int(sample_qty) if not np.isnan(sample_qty) and sample_qty >= 1 else 1
 
-        if np.isnan(usl) or np.isnan(lsl):
+        if has_status:
             params.append({
                 "col_idx": col_idx,
                 "title": str(title).strip(),
@@ -205,8 +252,11 @@ def discover_parameters(grid: list) -> list:
                 "usl": None,
                 "lsl": None,
                 "sample_qty": sample_qty,
+                "raw_df": raw_df,
             })
-        else:
+        elif has_numeric:
+            usl = to_float(cell(grid, USL_ROW - 1, col_idx))
+            lsl = to_float(cell(grid, LSL_ROW - 1, col_idx))
             params.append({
                 "col_idx": col_idx,
                 "title": str(title).strip(),
@@ -214,38 +264,10 @@ def discover_parameters(grid: list) -> list:
                 "usl": usl,
                 "lsl": lsl,
                 "sample_qty": sample_qty,
+                "raw_df": raw_df,
             })
+        # else: column has a title but no usable data at all -> skip
     return params
-
-
-def build_raw_dataframe(grid: list, param: dict) -> pd.DataFrame:
-    """Pull raw (row-level) date/time/value(+status) rows for one parameter column."""
-    rows = []
-    row_idx = DATA_START_ROW - 1
-    empty_streak = 0
-    while row_idx < len(grid) and row_idx < MAX_ROWS:
-        date_val = cell(grid, row_idx, DATE_COL)
-        time_val = cell(grid, row_idx, TIME_COL)
-        raw_val = cell(grid, row_idx, param["col_idx"])
-
-        if date_val is None and time_val is None and raw_val is None:
-            empty_streak += 1
-            if empty_streak >= 3:
-                break
-            row_idx += 1
-            continue
-        empty_streak = 0
-
-        dt = parse_datetime(date_val, time_val)
-        if param["type"] == "numeric":
-            value = to_float(raw_val)
-            rows.append({"datetime": dt, "value": value})
-        else:
-            status = classify_status(raw_val)
-            rows.append({"datetime": dt, "status": status, "raw": raw_val})
-        row_idx += 1
-
-    return pd.DataFrame(rows)
 
 
 def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: float) -> pd.DataFrame:
@@ -263,7 +285,7 @@ def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: floa
             continue
         avg = round(vals.mean(), DECIMALS + 3)
         std = vals.std(ddof=1) if len(vals) > 1 else np.nan
-        if std is None or np.isnan(std) or std == 0:
+        if std is None or np.isnan(std) or std == 0 or usl is None or lsl is None or np.isnan(usl) or np.isnan(lsl):
             cpk = np.nan
         else:
             cpk = min((usl - avg) / (3 * std), (avg - lsl) / (3 * std))
@@ -285,10 +307,12 @@ def plot_value_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
         line=dict(color="#1f77b4"),
         hovertemplate="%{x}<br>Value: %{y:.3f}<extra></extra>",
     ))
-    fig.add_hline(y=param["usl"], line=dict(color="red", dash="dash"),
-                  annotation_text=f"USL {fmt(param['usl'])}", annotation_position="top left")
-    fig.add_hline(y=param["lsl"], line=dict(color="red", dash="dash"),
-                  annotation_text=f"LSL {fmt(param['lsl'])}", annotation_position="bottom left")
+    if param["usl"] is not None and not np.isnan(param["usl"]):
+        fig.add_hline(y=param["usl"], line=dict(color="red", dash="dash"),
+                      annotation_text=f"USL {fmt(param['usl'])}", annotation_position="top left")
+    if param["lsl"] is not None and not np.isnan(param["lsl"]):
+        fig.add_hline(y=param["lsl"], line=dict(color="red", dash="dash"),
+                      annotation_text=f"LSL {fmt(param['lsl'])}", annotation_position="bottom left")
     fig.update_layout(
         title=f"{param['title']} — Value vs Time",
         xaxis_title="Time", yaxis_title="Value",
@@ -319,28 +343,27 @@ def plot_cpk_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
 
 def plot_attribute_chart(raw_df: pd.DataFrame, param: dict) -> go.Figure:
     """Bar chart over time for an OK/NOK (attribute) parameter.
-    Green bar = OK, red bar = NOK. Unclassified/blank rows are skipped."""
-    df = raw_df.dropna(subset=["status"]).copy()
-    df = df.reset_index(drop=True)
-    df["x_label"] = df.index.astype(str)  # fallback if datetime missing
+    Green bar = OK, red bar = NOK. Rows with unrecognized/blank status are skipped."""
+    df = raw_df.dropna(subset=["status"]).copy().reset_index(drop=True)
     has_dt = df["datetime"].notna().any()
-    x_vals = df["datetime"] if has_dt else df["x_label"]
+    x_vals = df["datetime"] if has_dt else df.index.astype(str)
 
     colors = df["status"].map({"OK": "#2ca02c", "NOK": "#d62728"})
+    ok_n = int((df["status"] == "OK").sum())
+    nok_n = int((df["status"] == "NOK").sum())
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=x_vals, y=[1] * len(df),
         marker_color=colors,
-        customdata=df[["status", "raw"]],
+        customdata=df[["status", "raw"]].astype(str),
         hovertemplate="%{x}<br>Result: %{customdata[0]}<extra></extra>",
         name="Result",
     ))
     fig.update_layout(
-        title=f"{param['title']} — OK / NOK over time "
-              f"(OK: {(df['status'] == 'OK').sum()}, NOK: {(df['status'] == 'NOK').sum()})",
+        title=f"{param['title']} — OK / NOK vs Time (OK: {ok_n}, NOK: {nok_n})",
         xaxis_title="Time", yaxis=dict(showticklabels=False, title=""),
-        height=320, margin=dict(t=60, b=40), showlegend=False,
+        height=320, margin=dict(t=60, b=40), showlegend=False, bargap=0.15,
     )
     return fig
 
@@ -369,11 +392,15 @@ def main():
         with st.spinner("Loading sheet data..."):
             grid = get_tab_values(spreadsheet_id, tab_name)
 
-        params = discover_parameters(grid)
+        with st.spinner("Scanning columns..."):
+            params = discover_parameters(grid)
+
         if not params:
-            st.warning("No parameter columns found on this tab "
-                       "(check that row 4/6/7/8 are filled in).")
+            st.warning("No parameter columns with data found on this tab.")
             st.stop()
+
+        numeric_count = sum(1 for p in params if p["type"] == "numeric")
+        attr_count = sum(1 for p in params if p["type"] == "attribute")
 
         def label(p):
             return p["title"] if p["type"] == "numeric" else f"{p['title']}  [OK/NOK]"
@@ -383,13 +410,16 @@ def main():
             "Parameter(s)", param_labels, default=param_labels[: min(3, len(param_labels))]
         )
 
-        # Date range, based on the first parameter's dates (Date/Time
-        # columns A/B are shared across the whole tab).
-        sample_df = build_raw_dataframe(grid, params[0]) if params else pd.DataFrame()
-        valid_dates = sample_df["datetime"].dropna() if not sample_df.empty else pd.Series(dtype="datetime64[ns]")
-        if not valid_dates.empty:
-            min_date = valid_dates.min().date()
-            max_date = valid_dates.max().date()
+        # Date range, based on whichever parameter has the most dates
+        # (Date/Time columns A/B are shared across the whole tab).
+        best_dates = pd.Series(dtype="datetime64[ns]")
+        for p in params:
+            d = p["raw_df"]["datetime"].dropna()
+            if len(d) > len(best_dates):
+                best_dates = d
+        if not best_dates.empty:
+            min_date = best_dates.min().date()
+            max_date = best_dates.max().date()
             date_range = st.date_input(
                 "Date range", value=(min_date, max_date),
                 min_value=min_date, max_value=max_date,
@@ -398,7 +428,7 @@ def main():
             date_range = None
             st.info("No parseable dates found in column A for this tab.")
 
-        st.caption(f"{len(params)} parameter(s) detected on this tab.")
+        st.caption(f"{numeric_count} numeric + {attr_count} OK/NOK parameter(s) detected.")
         if st.button("🔄 Refresh data"):
             list_tabs.clear()
             get_tab_values.clear()
@@ -412,7 +442,7 @@ def main():
     selected_params = [label_to_param[l] for l in selected_labels]
 
     for param in selected_params:
-        raw_df = build_raw_dataframe(grid, param)
+        raw_df = param["raw_df"]
 
         if isinstance(date_range, tuple) and len(date_range) == 2 and not raw_df.empty:
             start, end = date_range
