@@ -43,7 +43,7 @@ import streamlit as st
 # --------------------------------------------------------------------------
 LINES = {
     "Line 1 - Crankcase Master Metal VSD Short Leg": "1vfOOhvjS2yAix5wfutoKKQNdGPQp4lmlzqqRwHn0i84",
-    "Line 2 - Crankcase Master Metal VSD Long Leg": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
+    "Line 2 - Crankcase Master Metal FSD Long Leg": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
 }
 
 TITLE_ROW = 4          # row with parameter name / graph title
