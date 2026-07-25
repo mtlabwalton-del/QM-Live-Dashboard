@@ -43,7 +43,7 @@ import streamlit as st
 # --------------------------------------------------------------------------
 LINES = {
     "Line 1 - Crankcase Master Metal VSD Short Leg": "1vfOOhvjS2yAix5wfutoKKQNdGPQp4lmlzqqRwHn0i84",
-    "Line 2 - Crankcase Master Metal FSD Long Leg": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
+    "Line 2": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
 }
 
 TITLE_ROW = 4          # row with parameter name / graph title
@@ -179,6 +179,16 @@ def fmt(val):
     return f"{val:.{DECIMALS}f}"
 
 
+def col_letter(col_idx: int) -> str:
+    """0-indexed column number -> spreadsheet column letter (0->A, 3->D...)."""
+    n = col_idx + 1
+    letters = ""
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
 # --------------------------------------------------------------------------
 # Core: scan one column's data (row 9+), then decide its type from what's
 # actually in the data — this is the key fix: classification is data-driven,
@@ -244,9 +254,14 @@ def discover_parameters(grid: list) -> list:
         sample_qty = to_float(cell(grid, SAMPLE_QTY_ROW - 1, col_idx))
         sample_qty = int(sample_qty) if not np.isnan(sample_qty) and sample_qty >= 1 else 1
 
+        # Unique key suffix so repeated titles across columns never collide
+        # in Streamlit widget/element IDs.
+        uid = f"{col_letter(col_idx)}"
+
         if has_status:
             params.append({
                 "col_idx": col_idx,
+                "uid": uid,
                 "title": str(title).strip(),
                 "type": "attribute",
                 "usl": None,
@@ -259,6 +274,7 @@ def discover_parameters(grid: list) -> list:
             lsl = to_float(cell(grid, LSL_ROW - 1, col_idx))
             params.append({
                 "col_idx": col_idx,
+                "uid": uid,
                 "title": str(title).strip(),
                 "type": "numeric",
                 "usl": usl,
@@ -379,7 +395,7 @@ def main():
     with st.sidebar:
         st.header("Filters")
 
-        line_name = st.selectbox("Line", list(LINES.keys()))
+        line_name = st.selectbox("Line", list(LINES.keys()), key="sel_line")
         spreadsheet_id = LINES[line_name]
 
         with st.spinner("Loading tab list..."):
@@ -387,7 +403,7 @@ def main():
         if not tabs:
             st.warning("No tabs found in this sheet.")
             st.stop()
-        tab_name = st.selectbox("Sheet / Tab", tabs)
+        tab_name = st.selectbox("Sheet / Tab", tabs, key="sel_tab")
 
         with st.spinner("Loading sheet data..."):
             grid = get_tab_values(spreadsheet_id, tab_name)
@@ -403,11 +419,13 @@ def main():
         attr_count = sum(1 for p in params if p["type"] == "attribute")
 
         def label(p):
-            return p["title"] if p["type"] == "numeric" else f"{p['title']}  [OK/NOK]"
+            base = p["title"] if p["type"] == "numeric" else f"{p['title']}  [OK/NOK]"
+            return f"{base} ({p['uid']})"
 
         param_labels = [label(p) for p in params]
         selected_labels = st.multiselect(
-            "Parameter(s)", param_labels, default=param_labels[: min(3, len(param_labels))]
+            "Parameter(s)", param_labels, default=param_labels[: min(3, len(param_labels))],
+            key="sel_params",
         )
 
         # Date range, based on whichever parameter has the most dates
@@ -423,13 +441,14 @@ def main():
             date_range = st.date_input(
                 "Date range", value=(min_date, max_date),
                 min_value=min_date, max_value=max_date,
+                key="sel_date_range",
             )
         else:
             date_range = None
             st.info("No parseable dates found in column A for this tab.")
 
         st.caption(f"{numeric_count} numeric + {attr_count} OK/NOK parameter(s) detected.")
-        if st.button("🔄 Refresh data"):
+        if st.button("🔄 Refresh data", key="btn_refresh"):
             list_tabs.clear()
             get_tab_values.clear()
             st.rerun()
@@ -443,13 +462,14 @@ def main():
 
     for param in selected_params:
         raw_df = param["raw_df"]
+        uid = param["uid"]  # unique per-column suffix, used in every widget key below
 
         if isinstance(date_range, tuple) and len(date_range) == 2 and not raw_df.empty:
             start, end = date_range
             mask = (raw_df["datetime"].dt.date >= start) & (raw_df["datetime"].dt.date <= end)
             raw_df = raw_df[mask | raw_df["datetime"].isna()]
 
-        st.subheader(param["title"])
+        st.subheader(f"{param['title']}  (col {uid})")
 
         if param["type"] == "numeric":
             agg = group_and_aggregate(raw_df, param["sample_qty"], param["usl"], param["lsl"])
@@ -467,15 +487,17 @@ def main():
 
             col1, col2 = st.columns(2)
             with col1:
-                st.plotly_chart(plot_value_chart(agg, param), use_container_width=True)
+                st.plotly_chart(plot_value_chart(agg, param), use_container_width=True,
+                                 key=f"chart_value_{uid}")
             with col2:
-                st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True)
+                st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True,
+                                 key=f"chart_cpk_{uid}")
 
             with st.expander("Show data table"):
                 st.dataframe(agg.assign(
                     avg_value=agg["avg_value"].round(DECIMALS),
                     cpk=agg["cpk"].round(DECIMALS),
-                ), use_container_width=True)
+                ), use_container_width=True, key=f"table_{uid}")
 
         else:  # attribute / OK-NOK parameter
             if raw_df.empty or raw_df["status"].dropna().empty:
@@ -491,10 +513,12 @@ def main():
             c2.metric("NOK", int(nok_count))
             c3.metric("NOK rate", f"{(nok_count/total*100):.1f}%" if total else "-")
 
-            st.plotly_chart(plot_attribute_chart(raw_df, param), use_container_width=True)
+            st.plotly_chart(plot_attribute_chart(raw_df, param), use_container_width=True,
+                             key=f"chart_attr_{uid}")
 
             with st.expander("Show data table"):
-                st.dataframe(raw_df[["datetime", "raw", "status"]], use_container_width=True)
+                st.dataframe(raw_df[["datetime", "raw", "status"]], use_container_width=True,
+                             key=f"table_{uid}")
 
         st.divider()
 
