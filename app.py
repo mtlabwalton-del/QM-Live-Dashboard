@@ -38,6 +38,8 @@ Requires a Google Sheets API key stored in Streamlit secrets as
 GOOGLE_API_KEY (see README.md).
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -52,7 +54,7 @@ import streamlit as st
 # --------------------------------------------------------------------------
 LINES = {
     "Line 1 - Crankcase Master Metal VSD Short Leg": "1vfOOhvjS2yAix5wfutoKKQNdGPQp4lmlzqqRwHn0i84",
-    "Line 2 - Crankcase Master Metal VSD Long Leg": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
+    "Line 2": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
 }
 
 TITLE_ROW = 4           # row with parameter name / graph title
@@ -126,22 +128,41 @@ def get_tab_values(spreadsheet_id: str, tab_name: str) -> list:
 # Parsing helpers
 # --------------------------------------------------------------------------
 
+_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+
 def to_float(val):
     """Parse a cell into a float, or NaN if it isn't numeric. Rounded to a
     few extra decimal places beyond DECIMALS to kill binary floating-point
-    noise like 15.866999999999 that should really be 15.867."""
+    noise like 15.866999999999 that should really be 15.867.
+
+    Robust to stray formatting in cells like UCL/LCL that sometimes get
+    typed with units, plus/minus signs, or extra spaces (e.g. "10.5 mm",
+    "±0.05", " 9.7 "). Falls back to pulling the first numeric token out
+    of the text if a direct float() parse fails."""
     if val is None:
+        return np.nan
+    if isinstance(val, bool):
         return np.nan
     if isinstance(val, (int, float)):
         return round(float(val), DECIMALS + 3)
     s = str(val).strip()
     if s == "":
         return np.nan
-    s2 = s.replace(",", "")
+    s2 = s.replace(",", "").replace("\u00a0", " ").strip()
     try:
         return round(float(s2), DECIMALS + 3)
     except ValueError:
-        return np.nan
+        pass
+    # Fallback: extract the first numeric token from text like "10.5mm",
+    # "±0.05", "UCL: 10.3", etc.
+    match = _NUMBER_RE.search(s2)
+    if match:
+        try:
+            return round(float(match.group()), DECIMALS + 3)
+        except ValueError:
+            return np.nan
+    return np.nan
 
 
 def classify_status(val):
