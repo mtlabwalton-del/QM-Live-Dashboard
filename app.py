@@ -3,26 +3,35 @@ SPC / Quality Dashboard
 Reads QAP-style data from Google Sheets (public "anyone with link can view")
 and plots:
   - Value vs Time + Cpk vs Time for every NUMERIC parameter column
+    (with USL / LSL / UCL / LCL reference lines)
   - OK vs NOK bar chart (green/red) for every ATTRIBUTE (pass/fail) column
+  - A Summary Report: % of values out-of-limit for the whole sheet/tab,
+    and a fail-percentage bar chart per parameter.
 grouped by the "Sampling Qty" cell for each column.
 
 Sheet layout this app expects (row numbers, 1-indexed, same for every tab):
-    Row 4  -> Parameter title
-    Row 6  -> USL
-    Row 7  -> LSL
-    Row 8  -> Sampling Qty (group size used to average points on the graph)
-    Row 9+ -> Data. Col A = Date, Col B = Time, Col C = sample counter,
-              Col D onward = one column per parameter.
+    Row 4   -> Parameter title
+    Row 6   -> USL
+    Row 7   -> LSL
+    Row 8   -> UCL
+    Row 9   -> LCL
+    Row 10  -> Sampling Qty (group size used to average points on the graph)
+    Row 11+ -> Data. Col A = Date, Col B = Time, Col C = sample counter,
+               Col D onward = one column per parameter.
 
 HOW A COLUMN IS CLASSIFIED (data-driven, not header-driven):
 For every column from D onward with a non-empty title in row 4, the app
-reads the actual data starting at row 9 in THAT column. If it finds
+reads the actual data starting at row 11 in THAT column. If it finds
 OK / NOK - type text values (OK, NG, NOT OK, PASS, FAIL, etc.) in that
 column's data, the column is treated as an ATTRIBUTE column -> a green/red
 bar chart over time. If it finds numeric values instead, it's a NUMERIC
-column -> Value vs Time + Cpk vs Time charts using USL/LSL from rows 6/7.
-This matches columns anywhere in the sheet (e.g. G, I, J, K, M, N, O, P,
-S, V, W, X, Y, Z, ...) regardless of what's in the header rows.
+column -> Value vs Time (with USL/LSL/UCL/LCL lines) + Cpk vs Time charts.
+This matches columns anywhere in the sheet regardless of what's in the
+header rows.
+
+"OUT OF LIMIT" for the summary report means:
+  - Numeric parameters: raw value outside [LSL, USL] (the specification).
+  - Attribute parameters: any NOK / fail result.
 
 Configure your lines (line name -> Google Sheet ID) in LINES below.
 Requires a Google Sheets API key stored in Streamlit secrets as
@@ -43,23 +52,25 @@ import streamlit as st
 # --------------------------------------------------------------------------
 LINES = {
     "Line 1 - Crankcase Master Metal VSD Short Leg": "1vfOOhvjS2yAix5wfutoKKQNdGPQp4lmlzqqRwHn0i84",
-    "Line 2 - Crankcase Master Metal FSD Long Leg": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
+    "Line 2": "1AfTbwyK7e8ftAxSXZyZvgvuEgC9E9CivZsUMkeLudOI",
 }
 
-TITLE_ROW = 4          # row with parameter name / graph title
-USL_ROW = 6             # row with USL
-LSL_ROW = 7             # row with LSL
-SAMPLE_QTY_ROW = 8      # row with sampling quantity (group size)
-DATA_START_ROW = 9      # first row of actual data
-DATE_COL = 0             # column A (0-indexed)
-TIME_COL = 1             # column B (0-indexed)
-FIRST_PARAM_COL = 3      # column D (0-indexed) -> first parameter column
-MAX_COLS = 80            # how many columns wide to scan
-MAX_ROWS = 2000          # how many rows deep to scan for data
-EMPTY_ROW_STOP = 5       # stop scanning a column after this many fully-empty rows in a row
+TITLE_ROW = 4           # row with parameter name / graph title
+USL_ROW = 6              # row with USL
+LSL_ROW = 7              # row with LSL
+UCL_ROW = 8              # row with UCL
+LCL_ROW = 9              # row with LCL
+SAMPLE_QTY_ROW = 10      # row with sampling quantity (group size)
+DATA_START_ROW = 11      # first row of actual data
+DATE_COL = 0              # column A (0-indexed)
+TIME_COL = 1              # column B (0-indexed)
+FIRST_PARAM_COL = 3       # column D (0-indexed) -> first parameter column
+MAX_COLS = 80             # how many columns wide to scan
+MAX_ROWS = 3000           # how many rows deep to scan for data
+EMPTY_ROW_STOP = 5        # stop scanning a column after this many fully-empty rows in a row
 
-CPK_TARGET_LINE = 1.33   # common minimum-acceptable Cpk reference line
-DECIMALS = 3             # USL/LSL/values are rounded & displayed to this many places
+CPK_TARGET_LINE = 1.33    # common minimum-acceptable Cpk reference line
+DECIMALS = 3              # USL/LSL/UCL/LCL/values are rounded & displayed to this many places
 
 PASS_VALUES = {"OK", "OKAY", "PASS", "PASSED", "GOOD", "ACCEPT", "ACCEPTED"}
 FAIL_VALUES = {"NG", "NOT OK", "NOTOK", "NOK", "FAIL", "FAILED", "REJECT", "REJECTED", "NO"}
@@ -190,9 +201,9 @@ def col_letter(col_idx: int) -> str:
 
 
 # --------------------------------------------------------------------------
-# Core: scan one column's data (row 9+), then decide its type from what's
-# actually in the data — this is the key fix: classification is data-driven,
-# not based on what's in the USL/LSL header rows.
+# Core: scan one column's data (row 11+), then decide its type from what's
+# actually in the data — classification is data-driven, not based on what's
+# in the USL/LSL/UCL/LCL header rows.
 # --------------------------------------------------------------------------
 
 def scan_column(grid: list, col_idx: int) -> pd.DataFrame:
@@ -254,9 +265,9 @@ def discover_parameters(grid: list) -> list:
         sample_qty = to_float(cell(grid, SAMPLE_QTY_ROW - 1, col_idx))
         sample_qty = int(sample_qty) if not np.isnan(sample_qty) and sample_qty >= 1 else 1
 
-        # Unique key suffix so repeated titles across columns never collide
-        # in Streamlit widget/element IDs.
-        uid = f"{col_letter(col_idx)}"
+        # Unique key suffix (column letter) so repeated titles across
+        # columns never collide in Streamlit widget/element IDs.
+        uid = col_letter(col_idx)
 
         if has_status:
             params.append({
@@ -264,21 +275,21 @@ def discover_parameters(grid: list) -> list:
                 "uid": uid,
                 "title": str(title).strip(),
                 "type": "attribute",
-                "usl": None,
-                "lsl": None,
+                "usl": None, "lsl": None, "ucl": None, "lcl": None,
                 "sample_qty": sample_qty,
                 "raw_df": raw_df,
             })
         elif has_numeric:
             usl = to_float(cell(grid, USL_ROW - 1, col_idx))
             lsl = to_float(cell(grid, LSL_ROW - 1, col_idx))
+            ucl = to_float(cell(grid, UCL_ROW - 1, col_idx))
+            lcl = to_float(cell(grid, LCL_ROW - 1, col_idx))
             params.append({
                 "col_idx": col_idx,
                 "uid": uid,
                 "title": str(title).strip(),
                 "type": "numeric",
-                "usl": usl,
-                "lsl": lsl,
+                "usl": usl, "lsl": lsl, "ucl": ucl, "lcl": lcl,
                 "sample_qty": sample_qty,
                 "raw_df": raw_df,
             })
@@ -287,7 +298,8 @@ def discover_parameters(grid: list) -> list:
 
 
 def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: float) -> pd.DataFrame:
-    """Chunk rows into groups of `sample_qty`, average value, compute Cpk."""
+    """Chunk rows into groups of `sample_qty`, average value, compute Cpk.
+    Cpk uses USL/LSL (the specification), not UCL/LCL (control limits)."""
     if df.empty:
         return pd.DataFrame(columns=["datetime", "avg_value", "cpk", "n"])
 
@@ -312,6 +324,62 @@ def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: floa
 
 
 # --------------------------------------------------------------------------
+# Summary report: out-of-limit % per parameter and for the whole tab
+# --------------------------------------------------------------------------
+
+def build_summary(params: list) -> pd.DataFrame:
+    """For every parameter on the tab, compute total checked values and how
+    many are out of limit:
+      - numeric: value < LSL or value > USL (spec violation)
+      - attribute: status == 'NOK'
+    Returns one row per parameter with counts and fail percentage.
+    """
+    rows = []
+    for p in params:
+        df = p["raw_df"]
+        if p["type"] == "numeric":
+            vals = df["value"].dropna()
+            total = len(vals)
+            usl, lsl = p["usl"], p["lsl"]
+            if total == 0 or usl is None or lsl is None or np.isnan(usl) or np.isnan(lsl):
+                fail = np.nan
+            else:
+                fail = int(((vals < lsl) | (vals > usl)).sum())
+        else:
+            statuses = df["status"].dropna()
+            total = len(statuses)
+            fail = int((statuses == "NOK").sum()) if total else np.nan
+
+        fail_pct = (fail / total * 100) if (total and not (isinstance(fail, float) and np.isnan(fail))) else np.nan
+        rows.append({
+            "Parameter": f"{p['title']} ({p['uid']})",
+            "Type": "Numeric (spec)" if p["type"] == "numeric" else "OK/NOK",
+            "Total": total,
+            "Out of limit": fail if not (isinstance(fail, float) and np.isnan(fail)) else 0,
+            "Fail %": round(fail_pct, 2) if not np.isnan(fail_pct) else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_fail_pct_chart(summary_df: pd.DataFrame) -> go.Figure:
+    df = summary_df.dropna(subset=["Fail %"]).sort_values("Fail %", ascending=False)
+    colors = ["#d62728" if v >= 5 else ("#ff7f0e" if v > 0 else "#2ca02c") for v in df["Fail %"]]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=df["Parameter"], y=df["Fail %"],
+        marker_color=colors,
+        hovertemplate="%{x}<br>Fail: %{y:.2f}%<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Fail % by Parameter (this tab)",
+        xaxis_title="Parameter", yaxis_title="Fail %",
+        height=420, margin=dict(t=60, b=120),
+        xaxis_tickangle=-45,
+    )
+    return fig
+
+
+# --------------------------------------------------------------------------
 # Plotting
 # --------------------------------------------------------------------------
 
@@ -323,12 +391,17 @@ def plot_value_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
         line=dict(color="#1f77b4"),
         hovertemplate="%{x}<br>Value: %{y:.3f}<extra></extra>",
     ))
-    if param["usl"] is not None and not np.isnan(param["usl"]):
-        fig.add_hline(y=param["usl"], line=dict(color="red", dash="dash"),
-                      annotation_text=f"USL {fmt(param['usl'])}", annotation_position="top left")
-    if param["lsl"] is not None and not np.isnan(param["lsl"]):
-        fig.add_hline(y=param["lsl"], line=dict(color="red", dash="dash"),
-                      annotation_text=f"LSL {fmt(param['lsl'])}", annotation_position="bottom left")
+
+    def hline(val, color, dash, label, pos):
+        if val is not None and not np.isnan(val):
+            fig.add_hline(y=val, line=dict(color=color, dash=dash),
+                          annotation_text=f"{label} {fmt(val)}", annotation_position=pos)
+
+    hline(param["usl"], "red", "dash", "USL", "top left")
+    hline(param["lsl"], "red", "dash", "LSL", "bottom left")
+    hline(param.get("ucl"), "purple", "dot", "UCL", "top right")
+    hline(param.get("lcl"), "purple", "dot", "LCL", "bottom right")
+
     fig.update_layout(
         title=f"{param['title']} — Value vs Time",
         xaxis_title="Time", yaxis_title="Value",
@@ -424,7 +497,8 @@ def main():
 
         param_labels = [label(p) for p in params]
         selected_labels = st.multiselect(
-            "Parameter(s)", param_labels, default=param_labels[: min(3, len(param_labels))],
+            "Parameter(s) for detail charts", param_labels,
+            default=param_labels[: min(3, len(param_labels))],
             key="sel_params",
         )
 
@@ -453,8 +527,36 @@ def main():
             get_tab_values.clear()
             st.rerun()
 
+    # ---------------------------------------------------------------
+    # Summary report (covers the WHOLE tab, not just selected params)
+    # ---------------------------------------------------------------
+    st.header("📋 Summary Report")
+    summary_df = build_summary(params)
+
+    total_checked = int(summary_df["Total"].sum())
+    total_fail = int(summary_df["Out of limit"].sum())
+    overall_pct = round(total_fail / total_checked * 100, 2) if total_checked else 0.0
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Sheet / Tab", tab_name)
+    s2.metric("Total values checked", total_checked)
+    s3.metric("Out of limit", total_fail)
+    s4.metric("Out of limit %", f"{overall_pct}%")
+
+    with st.expander("Show per-parameter summary table", expanded=False):
+        st.dataframe(summary_df, use_container_width=True, key="table_summary")
+
+    if summary_df["Fail %"].notna().any():
+        st.plotly_chart(plot_fail_pct_chart(summary_df), use_container_width=True,
+                         key="chart_fail_pct")
+
+    st.divider()
+
+    # ---------------------------------------------------------------
+    # Detail charts for selected parameters
+    # ---------------------------------------------------------------
     if not selected_labels:
-        st.info("Select at least one parameter from the sidebar to see charts.")
+        st.info("Select at least one parameter from the sidebar to see detail charts.")
         return
 
     label_to_param = {label(p): p for p in params}
@@ -474,11 +576,13 @@ def main():
         if param["type"] == "numeric":
             agg = group_and_aggregate(raw_df, param["sample_qty"], param["usl"], param["lsl"])
 
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
             c1.metric("USL", fmt(param["usl"]))
             c2.metric("LSL", fmt(param["lsl"]))
-            c3.metric("Sample qty / point", param["sample_qty"])
-            c4.metric("Points plotted", len(agg))
+            c3.metric("UCL", fmt(param.get("ucl")))
+            c4.metric("LCL", fmt(param.get("lcl")))
+            c5.metric("Sample qty / point", param["sample_qty"])
+            c6.metric("Points plotted", len(agg))
 
             if agg.empty:
                 st.warning("No data available for the selected date range.")
