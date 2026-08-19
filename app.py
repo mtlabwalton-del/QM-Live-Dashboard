@@ -1,13 +1,14 @@
 """
 SPC / Quality Dashboard
 Reads QAP-style data from Google Sheets (public "anyone with link can view")
-and plots:
+and shows:
+  - A DYNAMIC, CLICKABLE drill-down Summary Report:
+        All Lines  --click a bar-->  Sheets/Tabs in that line
+                   --click a bar-->  Parameters in that tab (fail % ranked)
+                   --click a bar-->  Detail chart for that parameter
   - Value vs Time + Cpk vs Time for every NUMERIC parameter column
     (with USL / LSL / UCL / LCL reference lines)
   - OK vs NOK bar chart (green/red) for every ATTRIBUTE (pass/fail) column
-  - A Summary Report: % of values out-of-limit for the whole sheet/tab,
-    and a fail-percentage bar chart per parameter.
-grouped by the "Sampling Qty" cell for each column.
 
 Sheet layout this app expects (row numbers, 1-indexed, same for every tab):
     Row 4   -> Parameter title
@@ -26,8 +27,6 @@ OK / NOK - type text values (OK, NG, NOT OK, PASS, FAIL, etc.) in that
 column's data, the column is treated as an ATTRIBUTE column -> a green/red
 bar chart over time. If it finds numeric values instead, it's a NUMERIC
 column -> Value vs Time (with USL/LSL/UCL/LCL lines) + Cpk vs Time charts.
-This matches columns anywhere in the sheet regardless of what's in the
-header rows.
 
 "OUT OF LIMIT" for the summary report means:
   - Numeric parameters: raw value outside [LSL, USL] (the specification).
@@ -48,7 +47,7 @@ import streamlit as st
 
 # --------------------------------------------------------------------------
 # CONFIG — add / edit your production lines here.
-# Key   = name shown in the sidebar
+# Key   = name shown in the dashboard
 # Value = the Google Sheet ID (the long string in the sheet URL between
 #          /d/ and /edit)
 # --------------------------------------------------------------------------
@@ -154,8 +153,6 @@ def to_float(val):
         return round(float(s2), DECIMALS + 3)
     except ValueError:
         pass
-    # Fallback: extract the first numeric token from text like "10.5mm",
-    # "±0.05", "UCL: 10.3", etc.
     match = _NUMBER_RE.search(s2)
     if match:
         try:
@@ -286,19 +283,14 @@ def discover_parameters(grid: list) -> list:
         sample_qty = to_float(cell(grid, SAMPLE_QTY_ROW - 1, col_idx))
         sample_qty = int(sample_qty) if not np.isnan(sample_qty) and sample_qty >= 1 else 1
 
-        # Unique key suffix (column letter) so repeated titles across
-        # columns never collide in Streamlit widget/element IDs.
         uid = col_letter(col_idx)
 
         if has_status:
             params.append({
-                "col_idx": col_idx,
-                "uid": uid,
-                "title": str(title).strip(),
+                "col_idx": col_idx, "uid": uid, "title": str(title).strip(),
                 "type": "attribute",
                 "usl": None, "lsl": None, "ucl": None, "lcl": None,
-                "sample_qty": sample_qty,
-                "raw_df": raw_df,
+                "sample_qty": sample_qty, "raw_df": raw_df,
             })
         elif has_numeric:
             usl = to_float(cell(grid, USL_ROW - 1, col_idx))
@@ -306,16 +298,18 @@ def discover_parameters(grid: list) -> list:
             ucl = to_float(cell(grid, UCL_ROW - 1, col_idx))
             lcl = to_float(cell(grid, LCL_ROW - 1, col_idx))
             params.append({
-                "col_idx": col_idx,
-                "uid": uid,
-                "title": str(title).strip(),
+                "col_idx": col_idx, "uid": uid, "title": str(title).strip(),
                 "type": "numeric",
                 "usl": usl, "lsl": lsl, "ucl": ucl, "lcl": lcl,
-                "sample_qty": sample_qty,
-                "raw_df": raw_df,
+                "sample_qty": sample_qty, "raw_df": raw_df,
             })
         # else: column has a title but no usable data at all -> skip
     return params
+
+
+def param_label(p: dict) -> str:
+    base = p["title"] if p["type"] == "numeric" else f"{p['title']} [OK/NOK]"
+    return f"{base} ({p['uid']})"
 
 
 def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: float) -> pd.DataFrame:
@@ -345,16 +339,14 @@ def group_and_aggregate(df: pd.DataFrame, sample_qty: int, usl: float, lsl: floa
 
 
 # --------------------------------------------------------------------------
-# Summary report: out-of-limit % per parameter and for the whole tab
+# Summary aggregation — Parameter level (per tab) / Tab level (per line) /
+# Line level (across all lines). Each level rolls up "total checked" and
+# "out of limit" counts from the level below it.
 # --------------------------------------------------------------------------
 
-def build_summary(params: list) -> pd.DataFrame:
-    """For every parameter on the tab, compute total checked values and how
-    many are out of limit:
-      - numeric: value < LSL or value > USL (spec violation)
-      - attribute: status == 'NOK'
-    Returns one row per parameter with counts and fail percentage.
-    """
+def build_param_summary(params: list) -> pd.DataFrame:
+    """One row per parameter on a tab: total checked, out-of-limit count,
+    fail %. Numeric: value outside [LSL,USL]. Attribute: NOK result."""
     rows = []
     for p in params:
         df = p["raw_df"]
@@ -363,45 +355,94 @@ def build_summary(params: list) -> pd.DataFrame:
             total = len(vals)
             usl, lsl = p["usl"], p["lsl"]
             if total == 0 or usl is None or lsl is None or np.isnan(usl) or np.isnan(lsl):
-                fail = np.nan
+                fail = 0
             else:
                 fail = int(((vals < lsl) | (vals > usl)).sum())
         else:
             statuses = df["status"].dropna()
             total = len(statuses)
-            fail = int((statuses == "NOK").sum()) if total else np.nan
+            fail = int((statuses == "NOK").sum()) if total else 0
 
-        fail_pct = (fail / total * 100) if (total and not (isinstance(fail, float) and np.isnan(fail))) else np.nan
+        fail_pct = round(fail / total * 100, 2) if total else np.nan
         rows.append({
-            "Parameter": f"{p['title']} ({p['uid']})",
-            "Type": "Numeric (spec)" if p["type"] == "numeric" else "OK/NOK",
-            "Total": total,
-            "Out of limit": fail if not (isinstance(fail, float) and np.isnan(fail)) else 0,
-            "Fail %": round(fail_pct, 2) if not np.isnan(fail_pct) else np.nan,
+            "label": param_label(p), "uid": p["uid"], "Total": total,
+            "Fail": fail, "Fail %": fail_pct,
         })
     return pd.DataFrame(rows)
 
 
-def plot_fail_pct_chart(summary_df: pd.DataFrame) -> go.Figure:
-    df = summary_df.dropna(subset=["Fail %"]).sort_values("Fail %", ascending=False)
-    colors = ["#d62728" if v >= 5 else ("#ff7f0e" if v > 0 else "#2ca02c") for v in df["Fail %"]]
+@st.cache_data(ttl=300, show_spinner=False)
+def get_tab_rollup(spreadsheet_id: str, tab_name: str):
+    """(total_checked, total_fail, fail_pct) for one tab, rolled up from
+    every parameter on it."""
+    grid = get_tab_values(spreadsheet_id, tab_name)
+    params = discover_parameters(grid)
+    psum = build_param_summary(params)
+    total = int(psum["Total"].sum()) if not psum.empty else 0
+    fail = int(psum["Fail"].sum()) if not psum.empty else 0
+    pct = round(fail / total * 100, 2) if total else 0.0
+    return total, fail, pct
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_line_summary_df(spreadsheet_id: str) -> pd.DataFrame:
+    """One row per tab in a spreadsheet: total checked, fail count, fail %."""
+    tabs = list_tabs(spreadsheet_id)
+    rows = []
+    for t in tabs:
+        total, fail, pct = get_tab_rollup(spreadsheet_id, t)
+        rows.append({"label": t, "Total": total, "Fail": fail, "Fail %": pct})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_lines_summary_df() -> pd.DataFrame:
+    """One row per configured line: total checked, fail count, fail %,
+    rolled up across every tab in that line's spreadsheet."""
+    rows = []
+    for line_name, spreadsheet_id in LINES.items():
+        line_df = get_line_summary_df(spreadsheet_id)
+        total = int(line_df["Total"].sum()) if not line_df.empty else 0
+        fail = int(line_df["Fail"].sum()) if not line_df.empty else 0
+        pct = round(fail / total * 100, 2) if total else 0.0
+        rows.append({"label": line_name, "Total": total, "Fail": fail, "Fail %": pct})
+    return pd.DataFrame(rows)
+
+
+def plot_fail_bar(df: pd.DataFrame, title: str, x_title: str) -> go.Figure:
+    """Generic clickable fail-% bar chart used at every drill-down level."""
+    d = df.dropna(subset=["Fail %"]).sort_values("Fail %", ascending=False)
+    colors = ["#d62728" if v >= 5 else ("#ff7f0e" if v > 0 else "#2ca02c") for v in d["Fail %"]]
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=df["Parameter"], y=df["Fail %"],
+        x=d["label"], y=d["Fail %"],
         marker_color=colors,
-        hovertemplate="%{x}<br>Fail: %{y:.2f}%<extra></extra>",
+        customdata=d[["Total", "Fail"]],
+        hovertemplate="%{x}<br>Fail: %{y:.2f}%<br>Checked: %{customdata[0]}<br>Out of limit: %{customdata[1]}<extra></extra>",
     ))
     fig.update_layout(
-        title="Fail % by Parameter (this tab)",
-        xaxis_title="Parameter", yaxis_title="Fail %",
-        height=420, margin=dict(t=60, b=120),
-        xaxis_tickangle=-45,
+        title=title, xaxis_title=x_title, yaxis_title="Fail %",
+        height=440, margin=dict(t=60, b=140), xaxis_tickangle=-45,
     )
     return fig
 
 
+def get_click(event) -> str:
+    """Extract the clicked bar's x-axis category label from a plotly_chart
+    selection event, or None if nothing was clicked."""
+    if not event:
+        return None
+    sel = event.get("selection") if isinstance(event, dict) else getattr(event, "selection", None)
+    if not sel:
+        return None
+    points = sel.get("points") if isinstance(sel, dict) else getattr(sel, "points", None)
+    if not points:
+        return None
+    return points[0].get("x") if isinstance(points[0], dict) else getattr(points[0], "x", None)
+
+
 # --------------------------------------------------------------------------
-# Plotting
+# Detail-chart plotting (Value/Cpk for numeric, Bar for attribute)
 # --------------------------------------------------------------------------
 
 def plot_value_chart(agg: pd.DataFrame, param: dict) -> go.Figure:
@@ -478,173 +519,257 @@ def plot_attribute_chart(raw_df: pd.DataFrame, param: dict) -> go.Figure:
     return fig
 
 
+def render_param_detail(param: dict, date_range):
+    """Render the Value/Cpk (numeric) or OK-NOK bar (attribute) detail
+    chart(s) for one parameter, with metrics above."""
+    raw_df = param["raw_df"]
+    uid = param["uid"]
+
+    if isinstance(date_range, tuple) and len(date_range) == 2 and not raw_df.empty:
+        start, end = date_range
+        mask = (raw_df["datetime"].dt.date >= start) & (raw_df["datetime"].dt.date <= end)
+        raw_df = raw_df[mask | raw_df["datetime"].isna()]
+
+    st.subheader(f"{param['title']}  (col {uid})")
+
+    if param["type"] == "numeric":
+        agg = group_and_aggregate(raw_df, param["sample_qty"], param["usl"], param["lsl"])
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("USL", fmt(param["usl"]))
+        c2.metric("LSL", fmt(param["lsl"]))
+        c3.metric("UCL", fmt(param.get("ucl")))
+        c4.metric("LCL", fmt(param.get("lcl")))
+        c5.metric("Sample qty / point", param["sample_qty"])
+        c6.metric("Points plotted", len(agg))
+
+        if agg.empty:
+            st.warning("No data available for the selected date range.")
+            return
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(plot_value_chart(agg, param), use_container_width=True,
+                             key=f"chart_value_{uid}")
+        with col2:
+            st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True,
+                             key=f"chart_cpk_{uid}")
+
+        with st.expander("Show data table"):
+            st.dataframe(agg.assign(
+                avg_value=agg["avg_value"].round(DECIMALS),
+                cpk=agg["cpk"].round(DECIMALS),
+            ), use_container_width=True, key=f"table_{uid}")
+
+    else:  # attribute / OK-NOK parameter
+        if raw_df.empty or raw_df["status"].dropna().empty:
+            st.warning("No OK/NOK data available for the selected date range.")
+            return
+
+        ok_count = (raw_df["status"] == "OK").sum()
+        nok_count = (raw_df["status"] == "NOK").sum()
+        total = ok_count + nok_count
+        c1, c2, c3 = st.columns(3)
+        c1.metric("OK", int(ok_count))
+        c2.metric("NOK", int(nok_count))
+        c3.metric("NOK rate", f"{(nok_count/total*100):.1f}%" if total else "-")
+
+        st.plotly_chart(plot_attribute_chart(raw_df, param), use_container_width=True,
+                         key=f"chart_attr_{uid}")
+
+        with st.expander("Show data table"):
+            st.dataframe(raw_df[["datetime", "raw", "status"]], use_container_width=True,
+                         key=f"table_{uid}")
+
+
 # --------------------------------------------------------------------------
-# Streamlit UI
+# Streamlit UI — drill-down navigation state machine
 # --------------------------------------------------------------------------
+
+def init_state():
+    st.session_state.setdefault("drill_line", None)
+    st.session_state.setdefault("drill_tab", None)
+    st.session_state.setdefault("drill_param_uid", None)
+
+
+def go_home():
+    st.session_state.drill_line = None
+    st.session_state.drill_tab = None
+    st.session_state.drill_param_uid = None
+
+
+def go_to_line():
+    st.session_state.drill_tab = None
+    st.session_state.drill_param_uid = None
+
+
+def render_breadcrumbs():
+    parts = [("🏠 All Lines", go_home)]
+    if st.session_state.drill_line:
+        parts.append((st.session_state.drill_line, go_to_line))
+    if st.session_state.drill_tab:
+        parts.append((st.session_state.drill_tab, None))
+
+    cols = st.columns([1] * len(parts) + [6 - len(parts)])
+    for i, (label, action) in enumerate(parts):
+        with cols[i]:
+            if action is not None:
+                if st.button(label, key=f"bc_{i}_{label}"):
+                    action()
+                    st.rerun()
+            else:
+                st.markdown(f"**{label}**")
+
 
 def main():
     st.set_page_config(page_title="SPC Quality Dashboard", layout="wide")
     st.title("📊 SPC / Quality Dashboard")
+    init_state()
 
     with st.sidebar:
-        st.header("Filters")
-
-        line_name = st.selectbox("Line", list(LINES.keys()), key="sel_line")
-        spreadsheet_id = LINES[line_name]
-
-        with st.spinner("Loading tab list..."):
-            tabs = list_tabs(spreadsheet_id)
-        if not tabs:
-            st.warning("No tabs found in this sheet.")
-            st.stop()
-        tab_name = st.selectbox("Sheet / Tab", tabs, key="sel_tab")
-
-        with st.spinner("Loading sheet data..."):
-            grid = get_tab_values(spreadsheet_id, tab_name)
-
-        with st.spinner("Scanning columns..."):
-            params = discover_parameters(grid)
-
-        if not params:
-            st.warning("No parameter columns with data found on this tab.")
-            st.stop()
-
-        numeric_count = sum(1 for p in params if p["type"] == "numeric")
-        attr_count = sum(1 for p in params if p["type"] == "attribute")
-
-        def label(p):
-            base = p["title"] if p["type"] == "numeric" else f"{p['title']}  [OK/NOK]"
-            return f"{base} ({p['uid']})"
-
-        param_labels = [label(p) for p in params]
-        selected_labels = st.multiselect(
-            "Parameter(s) for detail charts", param_labels,
-            default=param_labels[: min(3, len(param_labels))],
-            key="sel_params",
-        )
-
-        # Date range, based on whichever parameter has the most dates
-        # (Date/Time columns A/B are shared across the whole tab).
-        best_dates = pd.Series(dtype="datetime64[ns]")
-        for p in params:
-            d = p["raw_df"]["datetime"].dropna()
-            if len(d) > len(best_dates):
-                best_dates = d
-        if not best_dates.empty:
-            min_date = best_dates.min().date()
-            max_date = best_dates.max().date()
-            date_range = st.date_input(
-                "Date range", value=(min_date, max_date),
-                min_value=min_date, max_value=max_date,
-                key="sel_date_range",
-            )
-        else:
-            date_range = None
-            st.info("No parseable dates found in column A for this tab.")
-
-        st.caption(f"{numeric_count} numeric + {attr_count} OK/NOK parameter(s) detected.")
-        if st.button("🔄 Refresh data", key="btn_refresh"):
+        st.header("Options")
+        if st.button("🔄 Refresh all data", key="btn_refresh"):
             list_tabs.clear()
             get_tab_values.clear()
+            get_tab_rollup.clear()
+            get_line_summary_df.clear()
+            get_all_lines_summary_df.clear()
+            st.rerun()
+        st.caption(
+            "Click any bar in the Summary Report to drill down: "
+            "Line → Sheet/Tab → Parameter → detail chart."
+        )
+
+    st.header("📋 Summary Report")
+    render_breadcrumbs()
+
+    # ---------------- LEVEL 1: all lines ----------------
+    if st.session_state.drill_line is None:
+        with st.spinner("Loading summary across all lines..."):
+            df = get_all_lines_summary_df()
+        if df.empty or df["Total"].sum() == 0:
+            st.info("No data found across the configured lines yet.")
+            return
+
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Lines", len(df))
+        t2.metric("Total values checked", int(df["Total"].sum()))
+        overall = round(df["Fail"].sum() / df["Total"].sum() * 100, 2) if df["Total"].sum() else 0
+        t3.metric("Overall out-of-limit %", f"{overall}%")
+
+        event = st.plotly_chart(
+            plot_fail_bar(df, "Fail % by Line (click a bar to drill in)", "Line"),
+            use_container_width=True, on_select="rerun", key="chart_lines",
+        )
+        clicked = get_click(event)
+        if clicked and clicked in LINES:
+            st.session_state.drill_line = clicked
             st.rerun()
 
-    # ---------------------------------------------------------------
-    # Summary report (covers the WHOLE tab, not just selected params)
-    # ---------------------------------------------------------------
-    st.header("📋 Summary Report")
-    summary_df = build_summary(params)
+        with st.expander("Show line summary table"):
+            st.dataframe(df, use_container_width=True, key="table_lines")
+        return
 
-    total_checked = int(summary_df["Total"].sum())
-    total_fail = int(summary_df["Out of limit"].sum())
-    overall_pct = round(total_fail / total_checked * 100, 2) if total_checked else 0.0
+    # ---------------- LEVEL 2: tabs within a line ----------------
+    spreadsheet_id = LINES[st.session_state.drill_line]
 
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Sheet / Tab", tab_name)
-    s2.metric("Total values checked", total_checked)
-    s3.metric("Out of limit", total_fail)
-    s4.metric("Out of limit %", f"{overall_pct}%")
+    if st.session_state.drill_tab is None:
+        with st.spinner("Loading summary for this line..."):
+            df = get_line_summary_df(spreadsheet_id)
+        if df.empty or df["Total"].sum() == 0:
+            st.info("No data found on this line's sheets yet.")
+            return
 
-    with st.expander("Show per-parameter summary table", expanded=False):
-        st.dataframe(summary_df, use_container_width=True, key="table_summary")
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Sheets / Tabs", len(df))
+        t2.metric("Total values checked", int(df["Total"].sum()))
+        overall = round(df["Fail"].sum() / df["Total"].sum() * 100, 2) if df["Total"].sum() else 0
+        t3.metric("Line out-of-limit %", f"{overall}%")
 
-    if summary_df["Fail %"].notna().any():
-        st.plotly_chart(plot_fail_pct_chart(summary_df), use_container_width=True,
-                         key="chart_fail_pct")
+        event = st.plotly_chart(
+            plot_fail_bar(df, "Fail % by Sheet/Tab (click a bar to drill in)", "Sheet / Tab"),
+            use_container_width=True, on_select="rerun", key="chart_tabs",
+        )
+        clicked = get_click(event)
+        if clicked and clicked in df["label"].values:
+            st.session_state.drill_tab = clicked
+            st.rerun()
+
+        with st.expander("Show tab summary table"):
+            st.dataframe(df, use_container_width=True, key="table_tabs")
+        return
+
+    # ---------------- LEVEL 3: parameters within a tab ----------------
+    tab_name = st.session_state.drill_tab
+    with st.spinner("Loading sheet data..."):
+        grid = get_tab_values(spreadsheet_id, tab_name)
+    with st.spinner("Scanning columns..."):
+        params = discover_parameters(grid)
+
+    if not params:
+        st.warning("No parameter columns with data found on this tab.")
+        return
+
+    psum = build_param_summary(params)
+    total = int(psum["Total"].sum())
+    fail = int(psum["Fail"].sum())
+    pct = round(fail / total * 100, 2) if total else 0.0
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Parameters", len(params))
+    t2.metric("Total values checked", total)
+    t3.metric("Out of limit", fail)
+    t4.metric("Out of limit %", f"{pct}%")
+
+    event = st.plotly_chart(
+        plot_fail_bar(psum, "Fail % by Parameter (click a bar for detail chart)", "Parameter"),
+        use_container_width=True, on_select="rerun", key="chart_params",
+    )
+    clicked = get_click(event)
+    uid_by_label = {row["label"]: row["uid"] for _, row in psum.iterrows()}
+    if clicked and clicked in uid_by_label:
+        st.session_state.drill_param_uid = uid_by_label[clicked]
+
+    with st.expander("Show parameter summary table"):
+        st.dataframe(psum.drop(columns=["uid"]), use_container_width=True, key="table_params")
 
     st.divider()
 
-    # ---------------------------------------------------------------
-    # Detail charts for selected parameters
-    # ---------------------------------------------------------------
+    # ---------------- Parameter detail (auto-shown after a click) ----------------
+    param_by_uid = {p["uid"]: p for p in params}
+    labels = [param_label(p) for p in params]
+    label_by_uid = {p["uid"]: param_label(p) for p in params}
+
+    default_labels = []
+    if st.session_state.drill_param_uid and st.session_state.drill_param_uid in label_by_uid:
+        default_labels = [label_by_uid[st.session_state.drill_param_uid]]
+
+    selected_labels = st.multiselect(
+        "Parameter(s) to show detail chart for (auto-filled from your click above; "
+        "add more here to compare)",
+        labels, default=default_labels, key="sel_detail_params",
+    )
+
     if not selected_labels:
-        st.info("Select at least one parameter from the sidebar to see detail charts.")
+        st.info("Click a bar above, or pick parameter(s) here, to see the detail chart.")
         return
 
-    label_to_param = {label(p): p for p in params}
-    selected_params = [label_to_param[l] for l in selected_labels]
+    best_dates = pd.Series(dtype="datetime64[ns]")
+    for p in params:
+        d = p["raw_df"]["datetime"].dropna()
+        if len(d) > len(best_dates):
+            best_dates = d
+    date_range = None
+    if not best_dates.empty:
+        min_date, max_date = best_dates.min().date(), best_dates.max().date()
+        date_range = st.date_input(
+            "Date range for detail chart(s)", value=(min_date, max_date),
+            min_value=min_date, max_value=max_date, key="sel_date_range",
+        )
 
-    for param in selected_params:
-        raw_df = param["raw_df"]
-        uid = param["uid"]  # unique per-column suffix, used in every widget key below
-
-        if isinstance(date_range, tuple) and len(date_range) == 2 and not raw_df.empty:
-            start, end = date_range
-            mask = (raw_df["datetime"].dt.date >= start) & (raw_df["datetime"].dt.date <= end)
-            raw_df = raw_df[mask | raw_df["datetime"].isna()]
-
-        st.subheader(f"{param['title']}  (col {uid})")
-
-        if param["type"] == "numeric":
-            agg = group_and_aggregate(raw_df, param["sample_qty"], param["usl"], param["lsl"])
-
-            c1, c2, c3, c4, c5, c6 = st.columns(6)
-            c1.metric("USL", fmt(param["usl"]))
-            c2.metric("LSL", fmt(param["lsl"]))
-            c3.metric("UCL", fmt(param.get("ucl")))
-            c4.metric("LCL", fmt(param.get("lcl")))
-            c5.metric("Sample qty / point", param["sample_qty"])
-            c6.metric("Points plotted", len(agg))
-
-            if agg.empty:
-                st.warning("No data available for the selected date range.")
-                st.divider()
-                continue
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.plotly_chart(plot_value_chart(agg, param), use_container_width=True,
-                                 key=f"chart_value_{uid}")
-            with col2:
-                st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True,
-                                 key=f"chart_cpk_{uid}")
-
-            with st.expander("Show data table"):
-                st.dataframe(agg.assign(
-                    avg_value=agg["avg_value"].round(DECIMALS),
-                    cpk=agg["cpk"].round(DECIMALS),
-                ), use_container_width=True, key=f"table_{uid}")
-
-        else:  # attribute / OK-NOK parameter
-            if raw_df.empty or raw_df["status"].dropna().empty:
-                st.warning("No OK/NOK data available for the selected date range.")
-                st.divider()
-                continue
-
-            ok_count = (raw_df["status"] == "OK").sum()
-            nok_count = (raw_df["status"] == "NOK").sum()
-            total = ok_count + nok_count
-            c1, c2, c3 = st.columns(3)
-            c1.metric("OK", int(ok_count))
-            c2.metric("NOK", int(nok_count))
-            c3.metric("NOK rate", f"{(nok_count/total*100):.1f}%" if total else "-")
-
-            st.plotly_chart(plot_attribute_chart(raw_df, param), use_container_width=True,
-                             key=f"chart_attr_{uid}")
-
-            with st.expander("Show data table"):
-                st.dataframe(raw_df[["datetime", "raw", "status"]], use_container_width=True,
-                             key=f"table_{uid}")
-
+    label_to_param = {param_label(p): p for p in params}
+    for lbl in selected_labels:
+        render_param_detail(label_to_param[lbl], date_range)
         st.divider()
 
 
