@@ -621,25 +621,10 @@ def render_breadcrumbs():
                 st.markdown(f"**{label}**")
 
 
-def main():
-    st.set_page_config(page_title="SPC Quality Dashboard", layout="wide")
-    st.title("📊 SPC / Quality Dashboard")
+def render_summary_report():
+    """The clickable drill-down report: All Lines -> Sheets/Tabs -> Parameters
+    -> detail chart. Independent of the sidebar Dashboard filters."""
     init_state()
-
-    with st.sidebar:
-        st.header("Options")
-        if st.button("🔄 Refresh all data", key="btn_refresh"):
-            list_tabs.clear()
-            get_tab_values.clear()
-            get_tab_rollup.clear()
-            get_line_summary_df.clear()
-            get_all_lines_summary_df.clear()
-            st.rerun()
-        st.caption(
-            "Click any bar in the Summary Report to drill down: "
-            "Line → Sheet/Tab → Parameter → detail chart."
-        )
-
     st.header("📋 Summary Report")
     render_breadcrumbs()
 
@@ -736,7 +721,6 @@ def main():
     st.divider()
 
     # ---------------- Parameter detail (auto-shown after a click) ----------------
-    param_by_uid = {p["uid"]: p for p in params}
     labels = [param_label(p) for p in params]
     label_by_uid = {p["uid"]: param_label(p) for p in params}
 
@@ -764,13 +748,106 @@ def main():
         min_date, max_date = best_dates.min().date(), best_dates.max().date()
         date_range = st.date_input(
             "Date range for detail chart(s)", value=(min_date, max_date),
-            min_value=min_date, max_value=max_date, key="sel_date_range",
+            min_value=min_date, max_value=max_date, key="sel_date_range_summary",
         )
 
     label_to_param = {param_label(p): p for p in params}
     for lbl in selected_labels:
         render_param_detail(label_to_param[lbl], date_range)
         st.divider()
+
+
+def render_dashboard():
+    """The original sidebar-filtered browsing view: pick a Line, a Sheet/Tab,
+    then one or more Parameters, and see their charts. Full manual control,
+    no clicking required."""
+    with st.sidebar:
+        st.header("Dashboard Filters")
+
+        line_name = st.selectbox("Line", list(LINES.keys()), key="dash_sel_line")
+        spreadsheet_id = LINES[line_name]
+
+        with st.spinner("Loading tab list..."):
+            tabs = list_tabs(spreadsheet_id)
+        if not tabs:
+            st.warning("No tabs found in this sheet.")
+            st.stop()
+        tab_name = st.selectbox("Sheet / Tab", tabs, key="dash_sel_tab")
+
+        with st.spinner("Loading sheet data..."):
+            grid = get_tab_values(spreadsheet_id, tab_name)
+        with st.spinner("Scanning columns..."):
+            params = discover_parameters(grid)
+
+        if not params:
+            st.warning("No parameter columns with data found on this tab.")
+            st.stop()
+
+        numeric_count = sum(1 for p in params if p["type"] == "numeric")
+        attr_count = sum(1 for p in params if p["type"] == "attribute")
+
+        param_labels = [param_label(p) for p in params]
+        selected_labels = st.multiselect(
+            "Parameter(s)", param_labels,
+            default=param_labels[: min(3, len(param_labels))],
+            key="dash_sel_params",
+        )
+
+        best_dates = pd.Series(dtype="datetime64[ns]")
+        for p in params:
+            d = p["raw_df"]["datetime"].dropna()
+            if len(d) > len(best_dates):
+                best_dates = d
+        if not best_dates.empty:
+            min_date, max_date = best_dates.min().date(), best_dates.max().date()
+            date_range = st.date_input(
+                "Date range", value=(min_date, max_date),
+                min_value=min_date, max_value=max_date,
+                key="dash_sel_date_range",
+            )
+        else:
+            date_range = None
+            st.info("No parseable dates found in column A for this tab.")
+
+        st.caption(f"{numeric_count} numeric + {attr_count} OK/NOK parameter(s) detected.")
+
+    if not selected_labels:
+        st.info("Select at least one parameter from the sidebar to see charts.")
+        return
+
+    label_to_param = {param_label(p): p for p in params}
+    for lbl in selected_labels:
+        render_param_detail(label_to_param[lbl], date_range)
+        st.divider()
+
+
+def main():
+    st.set_page_config(page_title="SPC Quality Dashboard", layout="wide")
+    st.title("📊 SPC / Quality Dashboard")
+
+    with st.sidebar:
+        view = st.radio(
+            "View", ["📈 Dashboard", "📋 Summary Report"],
+            key="view_mode",
+        )
+        st.divider()
+        if st.button("🔄 Refresh all data", key="btn_refresh"):
+            list_tabs.clear()
+            get_tab_values.clear()
+            get_tab_rollup.clear()
+            get_line_summary_df.clear()
+            get_all_lines_summary_df.clear()
+            st.rerun()
+        if view == "📋 Summary Report":
+            st.caption(
+                "Click any bar to drill down: Line → Sheet/Tab → "
+                "Parameter → detail chart."
+            )
+
+    if view == "📈 Dashboard":
+        render_dashboard()
+    else:
+        render_summary_report()
 
 
 if __name__ == "__main__":
