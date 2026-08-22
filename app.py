@@ -371,6 +371,45 @@ def build_param_summary(params: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_date_summary(params: list) -> pd.DataFrame:
+    """One row per calendar date found across ALL parameters' data on a tab:
+    total checked and fail count/percentage for that date, aggregated
+    across every parameter (numeric spec-violations + attribute NOKs).
+    Used for the 'Fail % by Date' drill-down chart."""
+    frames = []
+    for p in params:
+        df = p["raw_df"]
+        df = df.dropna(subset=["datetime"]).copy()
+        if df.empty:
+            continue
+        df["date"] = df["datetime"].dt.date
+        if p["type"] == "numeric":
+            usl, lsl = p["usl"], p["lsl"]
+            df["is_checked"] = df["value"].notna()
+            if usl is None or lsl is None or np.isnan(usl) or np.isnan(lsl):
+                df["is_fail"] = False
+            else:
+                df["is_fail"] = df["is_checked"] & ((df["value"] < lsl) | (df["value"] > usl))
+        else:
+            df["is_checked"] = df["status"].notna()
+            df["is_fail"] = df["status"] == "NOK"
+        frames.append(df[["date", "is_checked", "is_fail"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["label", "date", "Total", "Fail", "Fail %"])
+
+    all_df = pd.concat(frames, ignore_index=True)
+    grouped = all_df.groupby("date").agg(
+        Total=("is_checked", "sum"), Fail=("is_fail", "sum")
+    ).reset_index()
+    grouped["Fail %"] = grouped.apply(
+        lambda r: round(r["Fail"] / r["Total"] * 100, 2) if r["Total"] else np.nan, axis=1
+    )
+    grouped = grouped.sort_values("date")
+    grouped["label"] = grouped["date"].astype(str)
+    return grouped[["label", "date", "Total", "Fail", "Fail %"]]
+
+
 def filter_params_by_date(params: list, date_range) -> list:
     """Return a new list of param dicts whose raw_df is filtered to
     [start, end] (inclusive). Rows with no parseable date are kept (so we
@@ -479,7 +518,9 @@ def get_all_lines_date_bounds():
 
 
 def plot_fail_bar(df: pd.DataFrame, title: str, x_title: str) -> go.Figure:
-    """Generic clickable fail-% bar chart used at every drill-down level."""
+    """Generic clickable fail-% bar chart used at every drill-down level.
+    Sorted by Fail % descending (worst first) — use for Line/Tab/Parameter
+    level charts where ranking matters."""
     d = df.dropna(subset=["Fail %"]).sort_values("Fail %", ascending=False)
     colors = ["#d62728" if v >= 5 else ("#ff7f0e" if v > 0 else "#2ca02c") for v in d["Fail %"]]
     fig = go.Figure()
@@ -492,6 +533,26 @@ def plot_fail_bar(df: pd.DataFrame, title: str, x_title: str) -> go.Figure:
     fig.update_layout(
         title=title, xaxis_title=x_title, yaxis_title="Fail %",
         height=440, margin=dict(t=60, b=140), xaxis_tickangle=-45,
+    )
+    return fig
+
+
+def plot_date_bar(df: pd.DataFrame, title: str) -> go.Figure:
+    """Date-wise fail-% trend chart, sorted CHRONOLOGICALLY (not by
+    severity) so it reads left-to-right as a timeline. Click a bar to
+    focus on that specific date."""
+    d = df.dropna(subset=["Fail %"]).sort_values("label")
+    colors = ["#d62728" if v >= 5 else ("#ff7f0e" if v > 0 else "#2ca02c") for v in d["Fail %"]]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=d["label"], y=d["Fail %"],
+        marker_color=colors,
+        customdata=d[["Total", "Fail"]],
+        hovertemplate="%{x}<br>Fail: %{y:.2f}%<br>Checked: %{customdata[0]}<br>Out of limit: %{customdata[1]}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=title, xaxis_title="Date", yaxis_title="Fail %",
+        height=380, margin=dict(t=60, b=80), xaxis_tickangle=-45,
     )
     return fig
 
@@ -658,6 +719,7 @@ def render_param_detail(param: dict, date_range):
 def init_state():
     st.session_state.setdefault("drill_line", None)   # user-clicked focus line (None = auto/worst)
     st.session_state.setdefault("drill_tab", None)     # user-clicked focus tab  (None = auto/worst)
+    st.session_state.setdefault("drill_date", None)    # user-clicked focus date (None = whole range)
     st.session_state.setdefault("drill_param_uid", None)  # user-clicked focus parameter
 
 
@@ -674,13 +736,15 @@ def render_summary_report():
     """Cascading Summary Report, all on one page:
       1) Fail % by Line
       2) Fail % by Sheet/Tab, for the line focused above (worst by default)
-      3) Fail % by Parameter, for the tab focused above (worst by default)
-    Clicking a bar in chart 1 changes the focus line (and resets tab/param
-    focus below it); clicking in chart 2 changes the focus tab (and resets
-    param focus); clicking in chart 3 shows that parameter's detail chart.
-    A single date-range filter at the top applies to all three charts and
-    to the detail chart, so you can zoom into a specific time window to see
-    which line/sheet/parameter had problems in that window.
+      3) Fail % by Date, for the tab focused above (whole date range trend)
+      4) Fail % by Parameter, for the tab (and date, if one is focused)
+    Clicking a bar in chart 1 changes the focus line (resetting everything
+    below it); clicking in chart 2 changes the focus tab (resetting date +
+    parameter focus); clicking in chart 3 focuses a single date (narrowing
+    chart 4 to just that day); clicking in chart 4 shows that parameter's
+    detail chart. A single date-range filter at the top bounds all of this,
+    so you can zoom into a specific time window to see which line/sheet/
+    date/parameter had problems.
     """
     init_state()
     st.header("📋 Summary Report")
@@ -692,7 +756,7 @@ def render_summary_report():
     start_date = end_date = None
     if overall_min and overall_max:
         picked = st.date_input(
-            "📅 Date range (applies to all charts & the detail view below)",
+            "📅 Date range (bounds all charts & the detail view below)",
             value=(overall_min, overall_max),
             min_value=overall_min, max_value=overall_max,
             key="summary_date_range",
@@ -707,6 +771,7 @@ def render_summary_report():
     if st.button("🔁 Reset focus to worst offenders", key="btn_reset_focus"):
         st.session_state.drill_line = None
         st.session_state.drill_tab = None
+        st.session_state.drill_date = None
         st.session_state.drill_param_uid = None
         st.rerun()
 
@@ -735,6 +800,7 @@ def render_summary_report():
     if clicked1 and clicked1 in LINES:
         st.session_state.drill_line = clicked1
         st.session_state.drill_tab = None
+        st.session_state.drill_date = None
         st.session_state.drill_param_uid = None
         st.rerun()
 
@@ -767,6 +833,7 @@ def render_summary_report():
     clicked2 = get_click(event2)
     if clicked2 and clicked2 in df_tabs["label"].values:
         st.session_state.drill_tab = clicked2
+        st.session_state.drill_date = None
         st.session_state.drill_param_uid = None
         st.rerun()
 
@@ -776,37 +843,71 @@ def render_summary_report():
 
     st.divider()
 
-    # ---------------- 3) Fail % by Parameter within the focused tab ----------------
-    with st.spinner(f"Loading parameters for {current_tab}..."):
+    # Load this tab's parameters once (used by both the Date chart and the
+    # Parameter chart below it).
+    with st.spinner(f"Loading data for {current_tab}..."):
         grid = get_tab_values(spreadsheet_id, current_tab)
-        params = discover_parameters(grid)
+        all_params = discover_parameters(grid)
         if start_date and end_date:
-            params = filter_params_by_date(params, (start_date, end_date))
+            all_params = filter_params_by_date(all_params, (start_date, end_date))
 
-    if not params:
+    if not all_params:
         st.warning("No parameter columns with data found on this tab for this date range.")
         return
 
-    psum = build_param_summary(params)
-    total3 = int(psum["Total"].sum())
-    fail3 = int(psum["Fail"].sum())
-    pct3 = round(fail3 / total3 * 100, 2) if total3 else 0.0
+    # ---------------- 3) Fail % by Date within the focused tab ----------------
+    dsum = build_date_summary(all_params)
+    if dsum.empty or dsum["Total"].sum() == 0:
+        st.info(f"No dated data found on {current_tab} for this date range.")
+        return
 
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Parameters", len(params))
-    t2.metric("Total values checked", total3)
-    t3.metric("Out of limit", fail3)
-    t4.metric(f"{current_tab} out-of-limit %", f"{pct3}%")
-
-    st.subheader(f"3️⃣ Fail % by Parameter — {current_tab}")
+    st.subheader(f"3️⃣ Fail % by Date — {current_tab}")
     event3 = st.plotly_chart(
-        plot_fail_bar(psum, f"Fail % by Parameter in {current_tab} (click a bar for detail)", "Parameter"),
-        use_container_width=True, on_select="rerun", key="chart_params",
+        plot_date_bar(dsum, f"Fail % by Date in {current_tab} (click a bar to focus a day)"),
+        use_container_width=True, on_select="rerun", key="chart_dates",
     )
     clicked3 = get_click(event3)
+    if clicked3 and clicked3 in dsum["label"].values:
+        st.session_state.drill_date = clicked3
+        st.session_state.drill_param_uid = None
+        st.rerun()
+
+    if st.session_state.drill_date:
+        st.caption(f"Focused date: **{st.session_state.drill_date}** "
+                   f"(click 🔁 Reset above, or pick a different bar, to change)")
+        focus_params = filter_params_by_date(
+            all_params,
+            (pd.to_datetime(st.session_state.drill_date).date(),
+             pd.to_datetime(st.session_state.drill_date).date()),
+        )
+    else:
+        st.caption("Showing the whole selected date range below — click a bar above to zoom into one day.")
+        focus_params = all_params
+
+    st.divider()
+
+    # ---------------- 4) Fail % by Parameter (within tab, and date if focused) ----------------
+    psum = build_param_summary(focus_params)
+    total4 = int(psum["Total"].sum())
+    fail4 = int(psum["Fail"].sum())
+    pct4 = round(fail4 / total4 * 100, 2) if total4 else 0.0
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Parameters", len(focus_params))
+    t2.metric("Total values checked", total4)
+    t3.metric("Out of limit", fail4)
+    t4.metric("Out-of-limit %", f"{pct4}%")
+
+    scope_label = f"{current_tab} on {st.session_state.drill_date}" if st.session_state.drill_date else current_tab
+    st.subheader(f"4️⃣ Fail % by Parameter — {scope_label}")
+    event4 = st.plotly_chart(
+        plot_fail_bar(psum, f"Fail % by Parameter in {scope_label} (click a bar for detail)", "Parameter"),
+        use_container_width=True, on_select="rerun", key="chart_params",
+    )
+    clicked4 = get_click(event4)
     uid_by_label = {row["label"]: row["uid"] for _, row in psum.iterrows()}
-    if clicked3 and clicked3 in uid_by_label:
-        st.session_state.drill_param_uid = uid_by_label[clicked3]
+    if clicked4 and clicked4 in uid_by_label:
+        st.session_state.drill_param_uid = uid_by_label[clicked4]
         st.rerun()
 
     with st.expander("Show parameter summary table"):
@@ -814,9 +915,9 @@ def render_summary_report():
 
     st.divider()
 
-    # ---------------- Parameter detail (shown after clicking chart 3) ----------------
-    label_by_uid = {p["uid"]: param_label(p) for p in params}
-    label_to_param = {param_label(p): p for p in params}
+    # ---------------- Parameter detail (shown after clicking chart 4) ----------------
+    label_by_uid = {p["uid"]: param_label(p) for p in focus_params}
+    label_to_param = {param_label(p): p for p in all_params}  # use unfiltered params for the detail chart itself
     date_range = (start_date, end_date) if start_date and end_date else None
 
     if st.session_state.drill_param_uid and st.session_state.drill_param_uid in label_by_uid:
