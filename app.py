@@ -371,12 +371,35 @@ def build_param_summary(params: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def filter_params_by_date(params: list, date_range) -> list:
+    """Return a new list of param dicts whose raw_df is filtered to
+    [start, end] (inclusive). Rows with no parseable date are kept (so we
+    never silently drop data just because its date/time didn't parse)."""
+    if not date_range or not (isinstance(date_range, tuple) and len(date_range) == 2):
+        return params
+    start, end = date_range
+    if start is None or end is None:
+        return params
+    out = []
+    for p in params:
+        df = p["raw_df"]
+        if not df.empty:
+            mask = (df["datetime"].dt.date >= start) & (df["datetime"].dt.date <= end)
+            df = df[mask | df["datetime"].isna()]
+        p2 = dict(p)
+        p2["raw_df"] = df
+        out.append(p2)
+    return out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def get_tab_rollup(spreadsheet_id: str, tab_name: str):
+def get_tab_rollup(spreadsheet_id: str, tab_name: str, start_date=None, end_date=None):
     """(total_checked, total_fail, fail_pct) for one tab, rolled up from
-    every parameter on it."""
+    every parameter on it, optionally restricted to [start_date, end_date]."""
     grid = get_tab_values(spreadsheet_id, tab_name)
     params = discover_parameters(grid)
+    if start_date and end_date:
+        params = filter_params_by_date(params, (start_date, end_date))
     psum = build_param_summary(params)
     total = int(psum["Total"].sum()) if not psum.empty else 0
     fail = int(psum["Fail"].sum()) if not psum.empty else 0
@@ -385,28 +408,74 @@ def get_tab_rollup(spreadsheet_id: str, tab_name: str):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_line_summary_df(spreadsheet_id: str) -> pd.DataFrame:
+def get_line_summary_df(spreadsheet_id: str, start_date=None, end_date=None) -> pd.DataFrame:
     """One row per tab in a spreadsheet: total checked, fail count, fail %."""
     tabs = list_tabs(spreadsheet_id)
     rows = []
     for t in tabs:
-        total, fail, pct = get_tab_rollup(spreadsheet_id, t)
+        total, fail, pct = get_tab_rollup(spreadsheet_id, t, start_date, end_date)
         rows.append({"label": t, "Total": total, "Fail": fail, "Fail %": pct})
     return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_all_lines_summary_df() -> pd.DataFrame:
+def get_all_lines_summary_df(start_date=None, end_date=None) -> pd.DataFrame:
     """One row per configured line: total checked, fail count, fail %,
     rolled up across every tab in that line's spreadsheet."""
     rows = []
     for line_name, spreadsheet_id in LINES.items():
-        line_df = get_line_summary_df(spreadsheet_id)
+        line_df = get_line_summary_df(spreadsheet_id, start_date, end_date)
         total = int(line_df["Total"].sum()) if not line_df.empty else 0
         fail = int(line_df["Fail"].sum()) if not line_df.empty else 0
         pct = round(fail / total * 100, 2) if total else 0.0
         rows.append({"label": line_name, "Total": total, "Fail": fail, "Fail %": pct})
     return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
+# Date-range bounds (for the shared date_input widget on the Summary Report)
+# --------------------------------------------------------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_tab_date_bounds(spreadsheet_id: str, tab_name: str):
+    grid = get_tab_values(spreadsheet_id, tab_name)
+    params = discover_parameters(grid)
+    mn = mx = None
+    for p in params:
+        d = p["raw_df"]["datetime"].dropna()
+        if d.empty:
+            continue
+        dmin, dmax = d.min().date(), d.max().date()
+        mn = dmin if mn is None or dmin < mn else mn
+        mx = dmax if mx is None or dmax > mx else mx
+    return mn, mx
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_line_date_bounds(spreadsheet_id: str):
+    mn = mx = None
+    for t in list_tabs(spreadsheet_id):
+        tmn, tmx = get_tab_date_bounds(spreadsheet_id, t)
+        if tmn:
+            mn = tmn if mn is None or tmn < mn else mn
+        if tmx:
+            mx = tmx if mx is None or tmx > mx else mx
+    return mn, mx
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_all_lines_date_bounds():
+    mn = mx = None
+    for spreadsheet_id in LINES.values():
+        lmn, lmx = get_line_date_bounds(spreadsheet_id)
+        if lmn:
+            mn = lmn if mn is None or lmn < mn else mn
+        if lmx:
+            mx = lmx if mx is None or lmx > mx else mx
+    return mn, mx
+
+
+
 
 
 def plot_fail_bar(df: pd.DataFrame, title: str, x_title: str) -> go.Figure:
@@ -583,178 +652,189 @@ def render_param_detail(param: dict, date_range):
 
 
 # --------------------------------------------------------------------------
-# Streamlit UI — drill-down navigation state machine
+# Streamlit UI — cascading Summary Report (all 3 levels on one page)
 # --------------------------------------------------------------------------
 
 def init_state():
-    st.session_state.setdefault("drill_line", None)
-    st.session_state.setdefault("drill_tab", None)
-    st.session_state.setdefault("drill_param_uid", None)
+    st.session_state.setdefault("drill_line", None)   # user-clicked focus line (None = auto/worst)
+    st.session_state.setdefault("drill_tab", None)     # user-clicked focus tab  (None = auto/worst)
+    st.session_state.setdefault("drill_param_uid", None)  # user-clicked focus parameter
 
 
-def go_home():
-    st.session_state.drill_line = None
-    st.session_state.drill_tab = None
-    st.session_state.drill_param_uid = None
-
-
-def go_to_line():
-    st.session_state.drill_tab = None
-    st.session_state.drill_param_uid = None
-
-
-def render_breadcrumbs():
-    parts = [("🏠 All Lines", go_home)]
-    if st.session_state.drill_line:
-        parts.append((st.session_state.drill_line, go_to_line))
-    if st.session_state.drill_tab:
-        parts.append((st.session_state.drill_tab, None))
-
-    cols = st.columns([1] * len(parts) + [6 - len(parts)])
-    for i, (label, action) in enumerate(parts):
-        with cols[i]:
-            if action is not None:
-                if st.button(label, key=f"bc_{i}_{label}"):
-                    action()
-                    st.rerun()
-            else:
-                st.markdown(f"**{label}**")
+def worst_label(df: pd.DataFrame, fallback: str = None) -> str:
+    """Return the label with the highest Fail % in df, or `fallback` if
+    nothing usable is found."""
+    d = df.dropna(subset=["Fail %"])
+    if d.empty:
+        return fallback
+    return d.sort_values("Fail %", ascending=False)["label"].iloc[0]
 
 
 def render_summary_report():
-    """The clickable drill-down report: All Lines -> Sheets/Tabs -> Parameters
-    -> detail chart. Independent of the sidebar Dashboard filters."""
+    """Cascading Summary Report, all on one page:
+      1) Fail % by Line
+      2) Fail % by Sheet/Tab, for the line focused above (worst by default)
+      3) Fail % by Parameter, for the tab focused above (worst by default)
+    Clicking a bar in chart 1 changes the focus line (and resets tab/param
+    focus below it); clicking in chart 2 changes the focus tab (and resets
+    param focus); clicking in chart 3 shows that parameter's detail chart.
+    A single date-range filter at the top applies to all three charts and
+    to the detail chart, so you can zoom into a specific time window to see
+    which line/sheet/parameter had problems in that window.
+    """
     init_state()
     st.header("📋 Summary Report")
-    render_breadcrumbs()
 
-    # ---------------- LEVEL 1: all lines ----------------
-    if st.session_state.drill_line is None:
-        with st.spinner("Loading summary across all lines..."):
-            df = get_all_lines_summary_df()
-        if df.empty or df["Total"].sum() == 0:
-            st.info("No data found across the configured lines yet.")
-            return
+    # ---------------- Shared date-range filter ----------------
+    with st.spinner("Loading available date range..."):
+        overall_min, overall_max = get_all_lines_date_bounds()
 
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Lines", len(df))
-        t2.metric("Total values checked", int(df["Total"].sum()))
-        overall = round(df["Fail"].sum() / df["Total"].sum() * 100, 2) if df["Total"].sum() else 0
-        t3.metric("Overall out-of-limit %", f"{overall}%")
-
-        event = st.plotly_chart(
-            plot_fail_bar(df, "Fail % by Line (click a bar to drill in)", "Line"),
-            use_container_width=True, on_select="rerun", key="chart_lines",
+    start_date = end_date = None
+    if overall_min and overall_max:
+        picked = st.date_input(
+            "📅 Date range (applies to all charts & the detail view below)",
+            value=(overall_min, overall_max),
+            min_value=overall_min, max_value=overall_max,
+            key="summary_date_range",
         )
-        clicked = get_click(event)
-        if clicked and clicked in LINES:
-            st.session_state.drill_line = clicked
-            st.rerun()
+        if isinstance(picked, tuple) and len(picked) == 2:
+            start_date, end_date = picked
+        else:
+            start_date, end_date = overall_min, overall_max
+    else:
+        st.info("No parseable dates found yet across the configured lines.")
 
-        with st.expander("Show line summary table"):
-            st.dataframe(df, use_container_width=True, key="table_lines")
+    if st.button("🔁 Reset focus to worst offenders", key="btn_reset_focus"):
+        st.session_state.drill_line = None
+        st.session_state.drill_tab = None
+        st.session_state.drill_param_uid = None
+        st.rerun()
+
+    st.divider()
+
+    # ---------------- 1) Fail % by Line ----------------
+    with st.spinner("Loading line-level summary..."):
+        df_lines = get_all_lines_summary_df(start_date, end_date)
+
+    if df_lines.empty or df_lines["Total"].sum() == 0:
+        st.info("No data found across the configured lines for this date range.")
         return
 
-    # ---------------- LEVEL 2: tabs within a line ----------------
-    spreadsheet_id = LINES[st.session_state.drill_line]
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Lines", len(df_lines))
+    t2.metric("Total values checked", int(df_lines["Total"].sum()))
+    overall = round(df_lines["Fail"].sum() / df_lines["Total"].sum() * 100, 2) if df_lines["Total"].sum() else 0
+    t3.metric("Overall out-of-limit %", f"{overall}%")
 
-    if st.session_state.drill_tab is None:
-        with st.spinner("Loading summary for this line..."):
-            df = get_line_summary_df(spreadsheet_id)
-        if df.empty or df["Total"].sum() == 0:
-            st.info("No data found on this line's sheets yet.")
-            return
+    st.subheader("1️⃣ Fail % by Line")
+    event1 = st.plotly_chart(
+        plot_fail_bar(df_lines, "Fail % by Line (click a bar to focus)", "Line"),
+        use_container_width=True, on_select="rerun", key="chart_lines",
+    )
+    clicked1 = get_click(event1)
+    if clicked1 and clicked1 in LINES:
+        st.session_state.drill_line = clicked1
+        st.session_state.drill_tab = None
+        st.session_state.drill_param_uid = None
+        st.rerun()
 
-        t1, t2, t3 = st.columns(3)
-        t1.metric("Sheets / Tabs", len(df))
-        t2.metric("Total values checked", int(df["Total"].sum()))
-        overall = round(df["Fail"].sum() / df["Total"].sum() * 100, 2) if df["Total"].sum() else 0
-        t3.metric("Line out-of-limit %", f"{overall}%")
+    current_line = st.session_state.drill_line or worst_label(df_lines, list(LINES.keys())[0])
+    auto_tag = "" if st.session_state.drill_line else " _(auto: highest fail %)_"
+    st.caption(f"Focused line: **{current_line}**{auto_tag}")
+    spreadsheet_id = LINES[current_line]
 
-        event = st.plotly_chart(
-            plot_fail_bar(df, "Fail % by Sheet/Tab (click a bar to drill in)", "Sheet / Tab"),
-            use_container_width=True, on_select="rerun", key="chart_tabs",
-        )
-        clicked = get_click(event)
-        if clicked and clicked in df["label"].values:
-            st.session_state.drill_tab = clicked
-            st.rerun()
+    st.divider()
 
-        with st.expander("Show tab summary table"):
-            st.dataframe(df, use_container_width=True, key="table_tabs")
+    # ---------------- 2) Fail % by Sheet/Tab within the focused line ----------------
+    with st.spinner(f"Loading sheet/tab summary for {current_line}..."):
+        df_tabs = get_line_summary_df(spreadsheet_id, start_date, end_date)
+
+    if df_tabs.empty or df_tabs["Total"].sum() == 0:
+        st.info(f"No data found on {current_line}'s sheets for this date range.")
         return
 
-    # ---------------- LEVEL 3: parameters within a tab ----------------
-    tab_name = st.session_state.drill_tab
-    with st.spinner("Loading sheet data..."):
-        grid = get_tab_values(spreadsheet_id, tab_name)
-    with st.spinner("Scanning columns..."):
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Sheets / Tabs", len(df_tabs))
+    t2.metric("Total values checked", int(df_tabs["Total"].sum()))
+    overall2 = round(df_tabs["Fail"].sum() / df_tabs["Total"].sum() * 100, 2) if df_tabs["Total"].sum() else 0
+    t3.metric(f"{current_line} out-of-limit %", f"{overall2}%")
+
+    st.subheader(f"2️⃣ Fail % by Sheet/Tab — {current_line}")
+    event2 = st.plotly_chart(
+        plot_fail_bar(df_tabs, f"Fail % by Sheet/Tab in {current_line} (click a bar to focus)", "Sheet / Tab"),
+        use_container_width=True, on_select="rerun", key="chart_tabs",
+    )
+    clicked2 = get_click(event2)
+    if clicked2 and clicked2 in df_tabs["label"].values:
+        st.session_state.drill_tab = clicked2
+        st.session_state.drill_param_uid = None
+        st.rerun()
+
+    current_tab = st.session_state.drill_tab or worst_label(df_tabs, df_tabs["label"].iloc[0])
+    auto_tag2 = "" if st.session_state.drill_tab else " _(auto: highest fail %)_"
+    st.caption(f"Focused sheet/tab: **{current_tab}**{auto_tag2}")
+
+    st.divider()
+
+    # ---------------- 3) Fail % by Parameter within the focused tab ----------------
+    with st.spinner(f"Loading parameters for {current_tab}..."):
+        grid = get_tab_values(spreadsheet_id, current_tab)
         params = discover_parameters(grid)
+        if start_date and end_date:
+            params = filter_params_by_date(params, (start_date, end_date))
 
     if not params:
-        st.warning("No parameter columns with data found on this tab.")
+        st.warning("No parameter columns with data found on this tab for this date range.")
         return
 
     psum = build_param_summary(params)
-    total = int(psum["Total"].sum())
-    fail = int(psum["Fail"].sum())
-    pct = round(fail / total * 100, 2) if total else 0.0
+    total3 = int(psum["Total"].sum())
+    fail3 = int(psum["Fail"].sum())
+    pct3 = round(fail3 / total3 * 100, 2) if total3 else 0.0
 
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("Parameters", len(params))
-    t2.metric("Total values checked", total)
-    t3.metric("Out of limit", fail)
-    t4.metric("Out of limit %", f"{pct}%")
+    t2.metric("Total values checked", total3)
+    t3.metric("Out of limit", fail3)
+    t4.metric(f"{current_tab} out-of-limit %", f"{pct3}%")
 
-    event = st.plotly_chart(
-        plot_fail_bar(psum, "Fail % by Parameter (click a bar for detail chart)", "Parameter"),
+    st.subheader(f"3️⃣ Fail % by Parameter — {current_tab}")
+    event3 = st.plotly_chart(
+        plot_fail_bar(psum, f"Fail % by Parameter in {current_tab} (click a bar for detail)", "Parameter"),
         use_container_width=True, on_select="rerun", key="chart_params",
     )
-    clicked = get_click(event)
+    clicked3 = get_click(event3)
     uid_by_label = {row["label"]: row["uid"] for _, row in psum.iterrows()}
-    if clicked and clicked in uid_by_label:
-        st.session_state.drill_param_uid = uid_by_label[clicked]
+    if clicked3 and clicked3 in uid_by_label:
+        st.session_state.drill_param_uid = uid_by_label[clicked3]
+        st.rerun()
 
     with st.expander("Show parameter summary table"):
         st.dataframe(psum.drop(columns=["uid"]), use_container_width=True, key="table_params")
 
     st.divider()
 
-    # ---------------- Parameter detail (auto-shown after a click) ----------------
-    labels = [param_label(p) for p in params]
+    # ---------------- Parameter detail (shown after clicking chart 3) ----------------
     label_by_uid = {p["uid"]: param_label(p) for p in params}
-
-    default_labels = []
-    if st.session_state.drill_param_uid and st.session_state.drill_param_uid in label_by_uid:
-        default_labels = [label_by_uid[st.session_state.drill_param_uid]]
-
-    selected_labels = st.multiselect(
-        "Parameter(s) to show detail chart for (auto-filled from your click above; "
-        "add more here to compare)",
-        labels, default=default_labels, key="sel_detail_params",
-    )
-
-    if not selected_labels:
-        st.info("Click a bar above, or pick parameter(s) here, to see the detail chart.")
-        return
-
-    best_dates = pd.Series(dtype="datetime64[ns]")
-    for p in params:
-        d = p["raw_df"]["datetime"].dropna()
-        if len(d) > len(best_dates):
-            best_dates = d
-    date_range = None
-    if not best_dates.empty:
-        min_date, max_date = best_dates.min().date(), best_dates.max().date()
-        date_range = st.date_input(
-            "Date range for detail chart(s)", value=(min_date, max_date),
-            min_value=min_date, max_value=max_date, key="sel_date_range_summary",
-        )
-
     label_to_param = {param_label(p): p for p in params}
-    for lbl in selected_labels:
-        render_param_detail(label_to_param[lbl], date_range)
-        st.divider()
+    date_range = (start_date, end_date) if start_date and end_date else None
+
+    if st.session_state.drill_param_uid and st.session_state.drill_param_uid in label_by_uid:
+        focused_label = label_by_uid[st.session_state.drill_param_uid]
+        st.subheader(f"🔎 Detail: {focused_label}")
+        render_param_detail(label_to_param[focused_label], date_range)
+    else:
+        st.info("👆 Click a bar in the Parameter chart above to see its detail chart here.")
+
+    with st.expander("➕ Compare more parameters from this tab"):
+        extra_labels = st.multiselect(
+            "Add parameter(s) to compare alongside the focused one above",
+            [l for l in label_to_param if l != label_by_uid.get(st.session_state.drill_param_uid)],
+            key="sel_extra_params",
+        )
+        for lbl in extra_labels:
+            render_param_detail(label_to_param[lbl], date_range)
+            st.divider()
 
 
 def render_dashboard():
