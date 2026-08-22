@@ -588,11 +588,17 @@ def plot_attribute_chart(raw_df: pd.DataFrame, param: dict) -> go.Figure:
     return fig
 
 
-def render_param_detail(param: dict, date_range):
+def render_param_detail(param: dict, date_range, key_prefix: str = ""):
     """Render the Value/Cpk (numeric) or OK-NOK bar (attribute) detail
-    chart(s) for one parameter, with metrics above."""
+    chart(s) for one parameter, with metrics above.
+
+    key_prefix must be unique per calling context (e.g. "summary" vs
+    "dash") since this can now be called from both the Summary Report and
+    the Dashboard section on the SAME page render — without a prefix their
+    widget keys (based only on column uid) would collide."""
     raw_df = param["raw_df"]
     uid = param["uid"]
+    kp = f"{key_prefix}_" if key_prefix else ""
 
     if isinstance(date_range, tuple) and len(date_range) == 2 and not raw_df.empty:
         start, end = date_range
@@ -619,16 +625,16 @@ def render_param_detail(param: dict, date_range):
         col1, col2 = st.columns(2)
         with col1:
             st.plotly_chart(plot_value_chart(agg, param), use_container_width=True,
-                             key=f"chart_value_{uid}")
+                             key=f"{kp}chart_value_{uid}")
         with col2:
             st.plotly_chart(plot_cpk_chart(agg, param), use_container_width=True,
-                             key=f"chart_cpk_{uid}")
+                             key=f"{kp}chart_cpk_{uid}")
 
         with st.expander("Show data table"):
             st.dataframe(agg.assign(
                 avg_value=agg["avg_value"].round(DECIMALS),
                 cpk=agg["cpk"].round(DECIMALS),
-            ), use_container_width=True, key=f"table_{uid}")
+            ), use_container_width=True, key=f"{kp}table_{uid}")
 
     else:  # attribute / OK-NOK parameter
         if raw_df.empty or raw_df["status"].dropna().empty:
@@ -644,11 +650,11 @@ def render_param_detail(param: dict, date_range):
         c3.metric("NOK rate", f"{(nok_count/total*100):.1f}%" if total else "-")
 
         st.plotly_chart(plot_attribute_chart(raw_df, param), use_container_width=True,
-                         key=f"chart_attr_{uid}")
+                         key=f"{kp}chart_attr_{uid}")
 
         with st.expander("Show data table"):
             st.dataframe(raw_df[["datetime", "raw", "status"]], use_container_width=True,
-                         key=f"table_{uid}")
+                         key=f"{kp}table_{uid}")
 
 
 # --------------------------------------------------------------------------
@@ -822,7 +828,7 @@ def render_summary_report():
     if st.session_state.drill_param_uid and st.session_state.drill_param_uid in label_by_uid:
         focused_label = label_by_uid[st.session_state.drill_param_uid]
         st.subheader(f"🔎 Detail: {focused_label}")
-        render_param_detail(label_to_param[focused_label], date_range)
+        render_param_detail(label_to_param[focused_label], date_range, key_prefix="summary_focus")
     else:
         st.info("👆 Click a bar in the Parameter chart above to see its detail chart here.")
 
@@ -833,7 +839,7 @@ def render_summary_report():
             key="sel_extra_params",
         )
         for lbl in extra_labels:
-            render_param_detail(label_to_param[lbl], date_range)
+            render_param_detail(label_to_param[lbl], date_range, key_prefix="summary_extra")
             st.divider()
 
 
@@ -897,7 +903,7 @@ def render_dashboard():
 
     label_to_param = {param_label(p): p for p in params}
     for lbl in selected_labels:
-        render_param_detail(label_to_param[lbl], date_range)
+        render_param_detail(label_to_param[lbl], date_range, key_prefix="dash")
         st.divider()
 
 
@@ -906,28 +912,31 @@ def main():
     st.title("📊 SPC / Quality Dashboard")
 
     with st.sidebar:
-        view = st.radio(
-            "View", ["📈 Dashboard", "📋 Summary Report"],
-            key="view_mode",
-        )
-        st.divider()
         if st.button("🔄 Refresh all data", key="btn_refresh"):
             list_tabs.clear()
             get_tab_values.clear()
             get_tab_rollup.clear()
             get_line_summary_df.clear()
             get_all_lines_summary_df.clear()
+            get_tab_date_bounds.clear()
+            get_line_date_bounds.clear()
+            get_all_lines_date_bounds.clear()
             st.rerun()
-        if view == "📋 Summary Report":
-            st.caption(
-                "Click any bar to drill down: Line → Sheet/Tab → "
-                "Parameter → detail chart."
-            )
+        st.caption(
+            "Summary Report: click any bar to drill down — "
+            "Line → Sheet/Tab → Parameter → detail chart."
+        )
+        st.divider()
 
-    if view == "📈 Dashboard":
-        render_dashboard()
-    else:
-        render_summary_report()
+    # Summary Report first (click-linked drill-down across all lines/sheets)
+    render_summary_report()
+
+    st.divider()
+    st.divider()
+
+    # Regular Dashboard below it (manual Line/Tab/Parameter browsing via sidebar)
+    st.header("📈 Dashboard")
+    render_dashboard()
 
 
 if __name__ == "__main__":
